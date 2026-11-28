@@ -1,0 +1,4 @@
+import os
+from pathlib import Path
+
+DATA = Path(os.environ.get("LIAOBAN_DATA_ROOT") or Path(__file__).resolve().parents[2] / "data")

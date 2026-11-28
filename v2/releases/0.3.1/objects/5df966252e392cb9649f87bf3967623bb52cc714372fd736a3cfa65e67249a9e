@@ -1,0 +1,92 @@
+"""Load one immutable gameplay revision in a fresh process."""
+
+import base64
+import importlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def select_snapshot(root):
+    from packages import lb_core
+    modules = Path(root).resolve(strict=True) / "packages/lb_core"
+    lb_core.__path__.insert(0, str(modules))
+    return modules
+
+
+def validate(root):
+    from PIL import Image
+    modules = select_snapshot(root)
+    for script in modules.glob("*.py"):
+        loaded = importlib.import_module("packages.lb_core." + script.stem)
+        if Path(loaded.__file__).resolve() != script:
+            raise ValueError(f"玩法模块未从当前版本加载：{script.name}")
+    from apps.workbench.navigation import BUNDLE
+    importlib.import_module("apps.workbench.navigation_run")
+    importlib.import_module("apps.liaoban.preset_preview")
+    from packages.lb_core.flow_session import FlowTemplates
+    from packages.lb_core.navigation_catalog import NavigationCatalog, load_json
+    from packages.lb_core.navigation_vision import SceneVision
+    from packages.lb_core.personal_realm import RealmVision
+    if BUNDLE != Path(root).resolve() / "assets/navigation":
+        raise ValueError("导航素材未从当前版本加载")
+    catalog = NavigationCatalog()
+    SceneVision(catalog)
+    RealmVision()
+    rules = [r for r in catalog.data["rules"].values() if "region" not in r]
+    for name in ("personal-realm", "chapter", "team-preset", "battle"):
+        rules.extend(FlowTemplates(name + ".json").rules.values())
+    boss_script = (modules / "regional_boss.py").is_file()
+    boss_rules = (BUNDLE.parent / "flows/regional-boss.json").is_file()
+    if boss_script != boss_rules:
+        raise ValueError("地域鬼王玩法文件不完整")
+    if boss_script:
+        rules.extend(FlowTemplates("regional-boss.json").rules.values())
+    refs = {r["id"] for r in rules}
+    for rule in rules:
+        if len(rule["roi"]) != 4 or not 0 <= rule["threshold"] <= 1:
+            raise ValueError(f"识别规则无效：{rule['id']}")
+    refs.update(a["icon"] for a in catalog.daily_activities.values())
+    refs.update(v["id"] for m in load_json(BUNDLE / "materials.json") for v in m["variants"])
+    load_json(BUNDLE / "legacy/pages-v3.json")
+    images = {p.stem: p for p in (BUNDLE / "templates").glob("*.png")}
+    missing = refs - images.keys()
+    if missing:
+        raise ValueError("缺少识别模板：" + ", ".join(sorted(missing)))
+    for image in images.values():
+        with Image.open(image) as png:
+            if png.format != "PNG":
+                raise ValueError(f"模板格式无效：{image.name}")
+            png.verify()
+
+
+def read_preset(png, fields):
+    root = fields.get("contentRoot")
+    if not root:
+        from apps.liaoban.preset_preview import preview_preset
+        return preview_preset(png, fields)
+    result = subprocess.run(
+        [sys.executable, "-E", "-s", "-B", "-X", "utf8", "-m", "apps.liaoban.content_runtime", "preview", root],
+        cwd=Path(__file__).resolve().parents[2], encoding="utf-8", capture_output=True, timeout=60,
+        input=json.dumps({"png": base64.b64encode(png).decode("ascii"), "fields": fields}),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode:
+        raise ValueError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "预设预览失败")
+    return json.loads(result.stdout)
+
+
+if __name__ == "__main__":
+    mode, root = sys.argv[1:]
+    if mode == "validate":
+        validate(root)
+    elif mode == "preview":
+        request = json.load(sys.stdin)
+        if Path(__file__).with_name("release-trust.json").is_file():
+            from threading import Event
+            from .gameplay_lease import GameplayLease
+            lease = GameplayLease(request["fields"].pop("memberToken", ""), "preview", Event()).open(root)
+        else:
+            select_snapshot(root)
+        from apps.liaoban.preset_preview import preview_preset
+        print(json.dumps(preview_preset(base64.b64decode(request["png"]), request["fields"])))

@@ -1,0 +1,53 @@
+"""The screenshot format shared by the workbench and Liaoban."""
+
+from dataclasses import dataclass
+from io import BytesIO
+
+from PIL import Image
+
+from .materials import CANVAS_SIZE
+
+
+class ScreenshotError(ValueError):
+    """The source cannot supply a usable game image."""
+
+
+def require_landscape_16_9(width: int, height: int) -> None:
+    if width <= 0 or height <= 0 or width * 9 != height * 16:
+        raise ScreenshotError(f"请将模拟器改成16:9（当前画面尺寸为 {width} × {height}）")
+
+
+@dataclass(frozen=True, slots=True)
+class Screenshot:
+    # Consumers display and recognize png. The native bytes are for archival.
+    png: bytes
+    original_png: bytes
+    source_size: tuple[int, int]
+
+    @classmethod
+    def from_png(cls, data: bytes, *, expected_size: tuple[int, int] | None = None):
+        if not isinstance(data, bytes) or not data.endswith(b"\x00\x00\x00\x00IEND\xaeB\x60\x82"):
+            raise ScreenshotError("截图不是完整的 PNG")
+        try:
+            with Image.open(BytesIO(data), formats=("PNG",)) as image:
+                size = image.size
+                require_landscape_16_9(*size)
+                if expected_size is not None and size != expected_size:
+                    raise ScreenshotError("截图尺寸与阴阳师所在显示屏不一致，请重新连接。")
+                if image.n_frames != 1:
+                    raise ScreenshotError("需要单张 PNG 截图")
+                rgb = image.mode == "RGB"
+                image.verify()
+            if size == CANVAS_SIZE and rgb:
+                return cls(data, data, size)
+            with Image.open(BytesIO(data)) as image, image.convert("RGB") as source, BytesIO() as output:
+                if size == CANVAS_SIZE:
+                    source.save(output, format="PNG", compress_level=1)
+                else:
+                    with source.resize(CANVAS_SIZE, Image.Resampling.LANCZOS) as scaled:
+                        scaled.save(output, format="PNG", compress_level=1)
+                return cls(output.getvalue(), data, size)
+        except ScreenshotError:
+            raise
+        except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+            raise ScreenshotError("截图不是完整的 PNG") from exc

@@ -1,0 +1,187 @@
+"""Match saved color templates against a single game frame."""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+import os
+from pathlib import Path
+from time import perf_counter
+
+import cv2
+import numpy as np
+
+from .materials import normalized_rect, pixel_rect
+
+
+@dataclass(frozen=True)
+class TemplateVariant:
+    id: str
+    name: str
+    path: Path | None
+    search_rect_ratio: list
+    threshold: float
+
+
+def _decode(data):
+    if not data:
+        return None
+    return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _load_pattern(variant):
+    if type(variant.threshold) not in (float, int) or not 0 <= variant.threshold <= 1:
+        raise ValueError("匹配阈值需要在 0 到 1 之间")
+    if variant.path is None:
+        raise ValueError("模板图片路径无效")
+    pattern = _decode(variant.path.read_bytes())
+    if pattern is None:
+        raise ValueError("模板图片损坏，无法解码")
+    if not np.ptp(pattern, axis=(0, 1)).any():
+        raise ValueError("模板为纯色，缺少可匹配的纹理，请调整选区")
+    return pattern
+
+
+def correlation_map(search, pattern, mask=None):
+    scores = cv2.matchTemplate(search, pattern, cv2.TM_CCOEFF_NORMED, mask=mask)
+    if mask is not None:
+        scores[~np.isfinite(scores)] = -1
+    return scores
+
+
+def _score_map(frame, variant, pattern):
+    h, w = frame.shape[:2]
+    left, top, right, bottom = pixel_rect(variant.search_rect_ratio, (w, h))
+    ph, pw = pattern.shape[:2]
+    if pw > right - left or ph > bottom - top:
+        raise ValueError("搜索范围小于模板，请调整搜索范围")
+    roi = frame[top:bottom, left:right]
+    scores = correlation_map(roi, pattern)
+    return scores, roi, left, top
+
+
+def _match_variant(frame, variant):
+    h, w = frame.shape[:2]
+    pattern = _load_pattern(variant)
+    ph, pw = pattern.shape[:2]
+    scores, roi, left, top = _score_map(frame, variant, pattern)
+    _, score, _, (x, y) = cv2.minMaxLoc(scores)
+    # The floating-point correlation for identical pixels can be just below 1.
+    if score > .999 and np.array_equal(pattern, roi[y:y+ph, x:x+pw]):
+        score = 1.0
+    rect = normalized_rect([left+x, top+y, left+x+pw, top+y+ph], (w, h))
+    return {"score": score, "match_rect_ratio": rect, "status": "hit" if score >= variant.threshold else "miss"}
+
+
+def _variant_result(frame, variant):
+    row = {"id": variant.id, "name": variant.name, "threshold": variant.threshold,
+           "search_rect_ratio": variant.search_rect_ratio}
+    try:
+        row.update(_match_variant(frame, variant))
+    except OSError:
+        row.update(status="error", error="模板图片缺失或无法读取")
+    except ValueError as exc:
+        row.update(status="error", error=str(exc))
+    except cv2.error:
+        row.update(status="error", error="模板匹配计算失败，请检查图片和选区")
+    return row
+
+
+def _match_group(frame, variants):
+    # Each OpenCV search allocates its own score map and scratch space.
+    workers = min(4, os.cpu_count() or 1, len(variants))
+    match = partial(_variant_result, frame)
+    if workers == 1:
+        yield from map(match, variants)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            yield from pool.map(match, variants)
+
+
+def recognize_templates(frame_png: bytes, variants: list[TemplateVariant], on_progress=None):
+    if not variants:
+        raise ValueError("没有可测试的模板")
+    started = perf_counter()
+    frame = _decode(frame_png)
+    if frame is None:
+        raise ValueError("无法解码测试画面")
+    rows = []
+    for row in _match_group(frame, variants):
+        rows.append(row)
+        if on_progress:
+            on_progress(len(rows), len(variants))
+
+    valid = [row for row in rows if row["status"] != "error"]
+    hits = [row for row in valid if row["status"] == "hit"]
+    best = max(hits or valid, key=lambda row: row["score"], default=None)
+    status = "hit" if hits else "miss" if len(valid) == len(rows) else "error"
+    return {"status": status, "best_id": best["id"] if best else None, "variants": rows,
+            "elapsed_ms": round((perf_counter() - started) * 1000, 1)}
+
+
+def same_location(a, b):
+    """Group nearby peaks of the same icon, including different poses."""
+    x = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    y = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return x * y >= .55 * min(area_a, area_b)
+
+
+class PixelMatcher:
+    """Cache template pixels and use one BGR frame for all variants of a material."""
+
+    def __init__(self, variants):
+        if not variants:
+            raise ValueError("请选择模板素材")
+        self.patterns = []
+        self.errors = []
+        for variant in variants:
+            try:
+                self.patterns.append((variant, _load_pattern(variant)))
+            except (OSError, ValueError, cv2.error) as exc:
+                self.errors.append(f"{variant.name}：{exc}")
+        workers = min(4, os.cpu_count() or 1, len(self.patterns))
+        self.pool = ThreadPoolExecutor(workers) if workers > 1 else None
+
+    def close(self):
+        if self.pool:
+            self.pool.shutdown()
+
+    @staticmethod
+    def _locations(frame, item):
+        variant, pattern = item
+        scores, roi, left, top = _score_map(frame, variant, pattern)
+        ph, pw = pattern.shape[:2]
+        rows = []
+        while len(rows) < 32:
+            _, score, _, (x, y) = cv2.minMaxLoc(scores)
+            if score > .999 and np.array_equal(pattern, roi[y:y+ph, x:x+pw]):
+                score = 1.
+            if score < variant.threshold:
+                break
+            rect = normalized_rect([left+x, top+y, left+x+pw, top+y+ph], (frame.shape[1], frame.shape[0]))
+            rows.append({"rect": rect, "score": score, "variant": variant.id})
+            dx, dy = max(1, pw//2), max(1, ph//2)
+            scores[max(0,y-dy):y+dy+1, max(0,x-dx):x+dx+1] = -2
+        return rows
+
+    def match(self, frame):
+        def match(item):
+            try:
+                return self._locations(frame, item), None
+            except (cv2.error, ValueError) as exc:
+                return [], f"{item[0].name}：{exc}"
+        groups = self.pool.map(match, self.patterns) if self.pool else map(match, self.patterns)
+        found = []
+        errors = list(self.errors)
+        limited = False
+        for group, error in groups:
+            if error:
+                errors.append(error)
+            limited |= len(group) == 32
+            found.extend(group)
+        locations = []
+        for item in sorted(found, key=lambda v: -v["score"]):
+            if not any(same_location(item["rect"], prev["rect"]) for prev in locations):
+                locations.append(item)
+        return {"targets": locations, "limited": limited, "errors": errors}

@@ -1,0 +1,167 @@
+"""Resolve the running Onmyoji window and capture its own display."""
+
+import ctypes
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from PIL import Image
+
+from . import adb
+from .materials import CANVAS_SIZE
+from .screenshots import Screenshot, ScreenshotError, require_landscape_16_9
+
+
+_DISPLAY_HEADER = re.compile(r"^[ \t]*(?:Display:\s*)?mDisplayId=(\d+)\b[^\n]*", re.M)
+_COMPONENT = re.compile(r"\bu(\d+)\s+([\w.]+)/[^\s}]+", re.ASCII)
+ONMYOJI_PACKAGE = re.compile(r"com\.netease\.onmyoji(?:\.[a-zA-Z0-9_]+)*")
+
+
+class GameWindowPending(adb.AdbError):
+    """The selected device is reachable but its game window is in transition."""
+
+
+def _resolve_window(dump: str) -> dict:
+    matches = {}
+    headers = list(_DISPLAY_HEADER.finditer(dump))
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(dump)
+        block = dump[header.end():end]
+        app_line = re.search(r"^[ \t]*mFocusedApp=([^\n]*)", block, re.M)
+        focus_line = re.search(r"^[ \t]*mCurrentFocus=([^\n]*)", block, re.M)
+        app = _COMPONENT.search(app_line[1]) if app_line else None
+        focus = _COMPONENT.search(focus_line[1]) if focus_line else None
+        active = app or focus
+        if not active or not ONMYOJI_PACKAGE.fullmatch(active[2]):
+            continue
+        # Ignore stale game tasks behind another app, lock screen or permission dialog.
+        if focus_line and focus_line[1].strip() != "null":
+            if not focus or focus.groups() != active.groups():
+                continue
+        size = re.search(r"\bcur=(\d+)x(\d+)\b", block)
+        display_id = int(header[1])
+        identity = (display_id, active[2], int(active[1]))
+        matches[identity] = {
+            "display_id": display_id, "package": active[2], "user_id": int(active[1]),
+            "width": int(size[1]) if size else None,
+            "height": int(size[2]) if size else None,
+            "window_focused": bool(focus),
+        }
+    if not matches:
+        raise GameWindowPending("未找到阴阳师画面，请在选中的模拟器里打开阴阳师，关闭遮挡窗口后重试。")
+    if len(matches) > 1:
+        raise adb.AdbError("此模拟器中发现多个阴阳师窗口，请保留要连接的游戏窗口后重试。")
+    return next(iter(matches.values()))
+
+
+def _window(adb_path: str, serial: str) -> dict:
+    raw = adb._run(adb_path, "-s", serial, "shell", "dumpsys", "window", "displays")
+    return _resolve_window(raw.decode("utf-8", errors="replace"))
+
+
+def _physical_id(dump: str, display_id: int) -> str:
+    # ADB screencap -d takes a SurfaceFlinger physical ID, not the Android logical ID.
+    found = set()
+    for viewport in re.findall(r"DisplayViewport\{([^}]+)\}", dump):
+        logical = re.search(r"\bdisplayId\s*=\s*(\d+)\b", viewport)
+        physical = re.search(r"""\buniqueId\s*=\s*['"]local:(\d+)['"]""", viewport)
+        if re.search(r"\b(?:valid|isActive)\s*=\s*false\b", viewport):
+            continue
+        if logical and int(logical[1]) == display_id and physical:
+            found.add(physical[1])
+    if len(found) != 1:
+        raise adb.AdbError("无法将阴阳师的显示屏对应到 ADB 截图设备。MuMu 独立游戏画面需要对应实例的原生截图组件。")
+    return found.pop()
+
+
+def _capture_physical(adb_path: str, serial: str, window: dict) -> bytes:
+    if not window["window_focused"]:
+        raise GameWindowPending("阴阳师窗口还未获得焦点，请打开对应游戏画面后重试。")
+    raw = adb._run(adb_path, "-s", serial, "shell", "dumpsys", "display")
+    physical = _physical_id(raw.decode("utf-8", errors="replace"), window["display_id"])
+    return adb._run(adb_path, "-s", serial, "exec-out", "screencap", "-p", "-d", physical)
+
+
+def _native_frame(root: str, index: int, dll_path: str, package: str, output) -> None:
+    from .mumu_pixels import MuMuPixels
+
+    with MuMuPixels({"root": root, "index": index, "dll": dll_path}, package) as device:
+        raw = device.grab()
+        frame = Image.frombytes("RGB", device.size, bytes(raw), "raw", "RGBX", 0, -1)
+        output.write(f"{device.display}\n".encode("ascii"))
+        frame.save(output, format="PNG", compress_level=1)
+
+
+def _capture_mumu(mumu: dict, package: str) -> tuple[int, bytes]:
+    entry = [sys.executable, "-E", "-s", "-B", "-m", "packages.lb_core.displays",
+             mumu["root"], str(mumu["index"]), mumu["dll"], package]
+    try:
+        proc = subprocess.run(entry, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, cwd=Path(__file__).resolve().parents[2],
+                              timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired as exc:
+        raise adb.AdbError("MuMu 读取阴阳师画面超时，请检查模拟器后重试。") from exc
+    except OSError as exc:
+        raise adb.AdbError("无法启动 MuMu 截图组件。") from exc
+    native, separator, png = proc.stdout.partition(b"\n")
+    if proc.returncode or not separator or not native.isdigit():
+        detail = proc.stderr.decode("utf-8", errors="replace")
+        marker = next((s[9:] for s in reversed(detail.splitlines()) if s.startswith("LB_ERROR ")), "")
+        raise adb.AdbError(marker or "MuMu 读取阴阳师画面失败，请检查模拟器的截图组件。")
+    return int(native), png
+
+
+def capture_game_screenshot(adb_path: str, serial: str, *, mumu: dict | None = None) -> tuple[dict, Screenshot]:
+    """Capture the selected game display and retain the native PNG for archiving."""
+    if not serial or serial.startswith("-") or not re.fullmatch(r"[!-~]+", serial):
+        raise adb.AdbError("请选择一个有效的在线设备。")
+    target = _window(adb_path, serial)
+    expected_size = None
+    if target["width"] is not None and target["height"] is not None:
+        expected_size = (target["width"], target["height"])
+        try:
+            require_landscape_16_9(*expected_size)
+        except ScreenshotError as exc:
+            raise adb.AdbError(str(exc)) from exc
+    if mumu and mumu.get("dll"):
+        if target["user_id"] != 0:
+            raise adb.AdbError("MuMu 按包截图暂不支持 Android 用户分身，请选择主用户的游戏。")
+        native_id, png = _capture_mumu(mumu, target["package"])
+    else:
+        native_id = None
+        png = _capture_physical(adb_path, serial, target)
+    try:
+        shot = Screenshot.from_png(png, expected_size=expected_size)
+    except ScreenshotError as exc:
+        raise adb.AdbError(str(exc)) from exc
+    latest = _window(adb_path, serial)
+    if latest != target:
+        raise GameWindowPending("截图期间阴阳师窗口发生变化，等待画面稳定。")
+    return {"package": target["package"], "display_id": target["display_id"],
+            "user_id": target["user_id"], "native_display_id": native_id,
+            "width": CANVAS_SIZE[0], "height": CANVAS_SIZE[1],
+            "source_width": shot.source_size[0], "source_height": shot.source_size[1]}, shot
+
+
+def capture_game_frame(adb_path: str, serial: str, *, mumu: dict | None = None) -> tuple[dict, bytes]:
+    """Return the 1600 × 900 frame; source_width/source_height describe the native display."""
+    target, shot = capture_game_screenshot(adb_path, serial, mumu=mumu)
+    return target, shot.png
+
+
+if __name__ == "__main__":
+    try:
+        root, index, dll_path, package = sys.argv[1:]
+        with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as stream:
+            os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetStdHandle.argtypes = [ctypes.c_ulong]
+            kernel.GetStdHandle.restype = ctypes.c_void_p
+            kernel.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+            kernel.SetStdHandle(-11, kernel.GetStdHandle(-12))
+            _native_frame(root, int(index), dll_path, package, stream)
+    except Exception as exc:
+        sys.stderr.buffer.write(("LB_ERROR " + str(exc) + "\n").encode("utf-8", errors="replace"))
+        sys.exit(1)

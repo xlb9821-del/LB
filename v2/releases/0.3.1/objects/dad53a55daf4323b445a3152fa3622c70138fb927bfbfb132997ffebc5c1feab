@@ -1,0 +1,282 @@
+"""Timed recognition and touch primitives shared by scripts and the workbench."""
+
+from dataclasses import dataclass
+import math
+import random
+import time
+
+import cv2
+import numpy as np
+
+from . import adb, displays
+from .materials import CANVAS_SIZE, pixel_rect, ratio_rect
+from .recognition import same_location
+
+DEFAULT_INTERVAL_MS = 100
+FULL = (0., 0., 1., 1.)
+GESTURES = ("click", "hold", "swipe")
+MATCH_MODES = ("monitor", "appear", "disappear")
+CLICK_MS = (70, 130)
+RELEASE_GAP_MS = (350, 600)
+
+
+def _number(value, label, low, high, *, integer=False):
+    if type(value) not in (float, int) or not math.isfinite(value) or not low <= value <= high or integer and type(value) != int:
+        raise ValueError(f"{label}应在 {low} 到 {high} 之间")
+    return value
+
+
+def _range(values, label, low, high):
+    if not isinstance(values, (list, tuple)) or len(values) != 2:
+        raise ValueError(f"请填写{label}的最小值和最大值")
+    lo, hi = (_number(n, label, low, high, integer=True) for n in values)
+    if lo > hi:
+        raise ValueError(f"{label}的最小值不能大于最大值")
+    return lo, hi
+
+
+@dataclass
+class Operation:
+    mode: str
+    interval: int
+    timeout: int
+    consecutive: int
+    region: list
+    end_region: list
+    inner: list
+    change_fraction: float
+    pixel_delta: int
+    stable_ms: int
+    repeats: int
+    gap: tuple
+    duration: tuple
+    use_template: bool
+    ocr_run: str = "once"
+    ocr_wait: bool = False
+
+    @classmethod
+    def parse(cls, config):
+        mode = config.get("mode")
+        if mode not in (*MATCH_MODES, *GESTURES, "changed", "stable", "ocr"):
+            raise ValueError("请选择受支持的识别或手势操作")
+        ocr_run = config.get("ocrRun", "once")
+        if mode == "ocr" and ocr_run not in ("once", "continuous"):
+            raise ValueError("OCR 运行方式无效")
+        unlimited = mode in ("monitor", "ocr")
+        source = config.get("source", "template")
+        if source not in ("region", "template"):
+            raise ValueError("请选择操作区域来源")
+        use_template = mode in MATCH_MODES or mode in ("click", "hold") and source == "template"
+        duration = {"hold": [700, 1000], "swipe": [300, 500]}.get(mode, CLICK_MS)
+        return cls(mode, _number(config.get("interval", DEFAULT_INTERVAL_MS), "识别间隔（ms）", 10, 60000, integer=True),
+                   _number(config.get("timeout", 0 if unlimited else 10000), "超时（ms）",
+                           0 if unlimited else 100, 3600000, integer=True),
+                   _number(config.get("consecutive", 1), "连续帧数", 1, 100, integer=True),
+                   ratio_rect(config.get("region", FULL)), ratio_rect(config.get("endRegion", FULL)),
+                   ratio_rect(config.get("inner", [.15,.15,.85,.85])),
+                   _number(config.get("changePercent", 2), "变化面积（%）", .01, 100)/100,
+                   _number(config.get("pixelDelta", 20), "像素色差", 1, 255, integer=True),
+                   _number(config.get("stableMs", 500), "稳定时长（ms）", 1, 60000, integer=True),
+                   _number(config.get("repeats", 1), "执行次数", 1, 1000, integer=True),
+                   _range(config.get("gap", RELEASE_GAP_MS), "点击间隔（ms）", 0, 60000),
+                   _range(config.get("duration", duration), "手势时长（ms）", 1, 30000), use_template,
+                   ocr_run, mode == "ocr" and config.get("ocrCondition", "read") != "read")
+
+
+def random_point(rect, size, rng):
+    # Keep the actual pixel inside the half-open requested region (including corners).
+    x, y, X, Y = rect
+    def pick(lo, hi, extent):
+        start = min(extent-1, math.ceil(lo*extent))
+        end = min(extent-1, math.ceil(hi*extent)-1)
+        return rng.randint(start,end) if start <= end else min(extent-1,int((lo+hi)*extent/2))
+    return pick(x,X,size[0]), pick(y,Y,size[1])
+
+
+def inside_target(rect, inner):
+    l,t,r,b = rect
+    return [l+(r-l)*inner[0], t+(b-t)*inner[1], l+(r-l)*inner[2], t+(b-t)*inner[3]]
+
+
+class TargetPoint(tuple):
+    """Keep the center for recognition and attach its safe touch area for input."""
+
+    def __new__(cls, x, y, width, height):
+        point = super().__new__(cls, (x + width // 2, y + height // 2))
+        point.region = inside_target(
+            (max(0, x) / 1600, max(0, y) / 900, min(1600, x + width) / 1600, min(900, y + height) / 900),
+            (.15, .15, .85, .85),
+        )
+        return point
+
+
+def sample_gesture(region, end_region, duration, size, rng):
+    start = random_point(region, size, rng)
+    end = random_point(end_region, size, rng) if end_region is not None else start
+    return start, end, rng.randint(*duration)
+
+
+class GameDevice:
+    def __init__(self, pixels, adb_path, serial, binding, size):
+        self.pixels = pixels
+        self.adb_path = adb_path
+        self.serial = serial
+        self.package, self.user, self.display, self.native = binding
+        self.size = tuple(size)
+        self.checked = None
+
+    def verify(self, for_input=False):
+        target = displays._window(self.adb_path, self.serial)
+        if (target["package"],target["user_id"],target["display_id"]) != (self.package,self.user,self.display):
+            raise adb.AdbError("游戏或显示屏已切换，请重新连接")
+        dimensions = target["width"],target["height"]
+        if (all(dimensions) and dimensions != self.size) or self.pixels.display != self.native:
+            raise adb.AdbError("游戏画面尺寸或设备已变化，请重新连接")
+        if for_input and (not target["window_focused"] or dimensions != self.size):
+            raise adb.AdbError("游戏未获得输入焦点或输入坐标尺寸不明确，已停止手势")
+        self.checked = time.perf_counter()
+
+    def read(self):
+        if self.checked is None or time.perf_counter()-self.checked >= 1:
+            self.verify()
+        image = self.pixels.read()
+        if self.pixels.size != self.size:
+            raise adb.AdbError("游戏原始分辨率发生变化，请重新连接")
+        return image
+
+    def touch(self, start, end, duration):
+        # Android targets a logical display. The native renderer ID is only for capture.
+        adb._run(self.adb_path, "-s", self.serial, "shell", "input", "touchscreen", "-d", str(self.display),
+                 "swipe", *map(str, (*start, *end, duration)), timeout=duration/1000 + 8)
+
+
+def changed_area(a, b, delta):
+    diff = cv2.absdiff(a, b)
+    return np.count_nonzero(np.max(diff, axis=2) >= delta) / (diff.shape[0]*diff.shape[1])
+
+
+def run_operation(config, device, matcher, cancel, report, *, previous_release=None, rng=None, clock=time.perf_counter, read_ocr=None):
+    """Schedule from sample start, skip missed ticks, release no further touches after cancel."""
+    rng = rng or random.Random()
+    started = clock()
+    deadline = started + config.timeout/1000 if config.timeout else math.inf
+    due = started
+    next_touch = started if previous_release is None else previous_release + rng.randint(*config.gap)/1000
+    mode = config.mode
+    timed_status = "complete" if mode == "monitor" or mode == "ocr" and not config.ocr_wait else "timeout"
+    baseline = previous = last_target = None
+    stable_since = None
+    seen = False
+    streak = samples = executed = 0
+    last_frame = last_time = None
+    state = {"samples": 0, "executed": 0, "targets": [], "lastGesture": None, "condition": "等待采样"}
+
+    def publish(status, condition=None):
+        if condition is not None:
+            state["condition"] = condition
+        state.update(status=status, elapsedMs=round((clock()-started)*1000))
+        report(dict(state), last_frame)
+        return dict(state)
+
+    if config.use_template and matcher is None:
+        raise ValueError("请选择识别模板")
+    while not cancel.is_set():
+        wait_until = max(due, next_touch) if mode in GESTURES else due
+        if cancel.wait(max(0,min(wait_until, deadline)-clock())):
+            break
+        if clock() >= deadline:
+            return publish(timed_status)
+        tick = clock()
+        due = tick + config.interval/1000
+        # For a gesture, verify the foreground first, then locate on the newest pixel frame.
+        if mode in GESTURES:
+            device.verify(for_input=True)
+        last_frame = device.read()
+        samples += 1
+        state.update(samples=samples, periodMs=round((tick-last_time)*1000,1) if last_time is not None else None)
+        last_time = tick
+        ready = False
+        if mode == "ocr":
+            result = read_ocr(last_frame)
+            state.update(ocr=result, condition=result["condition"])
+            streak = streak + 1 if result["matched"] else 0
+            ready = config.ocr_run == "once" or config.ocr_wait and streak >= config.consecutive
+        elif config.use_template:
+            result = matcher.match(last_frame)
+            targets = result["targets"]
+            state.update(result)
+            state["condition"] = "多个目标" if len(targets)>1 else "唯一目标" if targets else "未命中"
+            if result["errors"] and (not targets or mode in GESTURES):
+                raise ValueError("模板无法完整识别：" + "、".join(result["errors"]))
+            if targets:
+                seen = True
+            if mode in GESTURES and (len(targets)>1 or result["limited"]):
+                return publish("ambiguous", "目标不唯一，未发送手势")
+            if mode == "disappear":
+                streak = streak+1 if seen and not targets else 0
+                if not seen:
+                    state["condition"] = "等待目标首次出现"
+            elif targets:
+                # Confirm presence across frames; for a gesture confirm the same physical target.
+                rect = targets[0]["rect"]
+                streak = 1 if mode in GESTURES and last_target and not same_location(rect,last_target) else streak+1
+                last_target = rect
+            else:
+                streak = 0
+                last_target = None
+            ready = mode != "monitor" and streak >= config.consecutive
+        elif mode in ("changed","stable"):
+            x,y,X,Y = pixel_rect(config.region, CANVAS_SIZE)
+            region = last_frame[y:Y,x:X]
+            if baseline is None:
+                baseline = region.copy()
+                stable_since = tick
+                state.update(change=0., condition="已记录基准画面")
+            else:
+                fraction = changed_area(region,baseline,config.pixel_delta)
+                state["change"] = fraction
+                if mode == "changed":
+                    streak = streak+1 if fraction >= config.change_fraction else 0
+                    ready = streak >= config.consecutive
+                    state["condition"] = "画面已变化" if ready else "等待画面变化"
+                else:
+                    if max(fraction,changed_area(region,previous,config.pixel_delta)) >= config.change_fraction:
+                        stable_since = tick
+                        baseline = region.copy()
+                    state["stableMs"] = round((tick-stable_since)*1000)
+                    ready = (tick-stable_since)*1000 >= config.stable_ms
+                    state["condition"] = "画面已稳定" if ready else "等待画面稳定"
+            if mode == "stable":
+                previous = region.copy()
+        else:
+            ready = True
+        state.update(streak=streak, processingMs=round((clock()-tick)*1000,1))
+        if cancel.is_set():
+            break
+        if clock() >= deadline:
+            return publish(timed_status)
+        if ready and mode in GESTURES:
+            rect = inside_target(last_target,config.inner) if config.use_template else config.region
+            start, end, duration = sample_gesture(
+                rect, config.end_region if mode == "swipe" else None, config.duration, device.size, rng
+            )
+            if config.use_template and clock()-tick > .25:
+                device.verify(for_input=True)
+            if cancel.is_set():
+                break
+            if clock() >= deadline:
+                return publish("timeout")
+            device.touch(start,end,duration)
+            release = clock()
+            executed += 1
+            gap = rng.randint(*config.gap)
+            next_touch = release + gap/1000
+            state.update(executed=executed, release=release, condition="已执行手势",
+                         lastGesture={"start":start,"end":end,"duration":duration,"gap":gap,"size":device.size})
+            ready = executed == config.repeats
+            streak = 0
+            last_target = None
+        if ready:
+            return publish("complete")
+        publish("running")
+    return publish("stopped", "已停止")

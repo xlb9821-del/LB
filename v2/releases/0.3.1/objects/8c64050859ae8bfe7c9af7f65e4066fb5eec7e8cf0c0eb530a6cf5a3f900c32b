@@ -1,0 +1,395 @@
+"""Local JSON-lines interface for device preview and saved capture inspection."""
+
+import base64
+from datetime import datetime, timezone
+from io import BytesIO
+import json
+from pathlib import Path
+import sys
+
+from PIL import Image
+
+from threading import Lock, Thread
+from .data_paths import DATA
+try:
+    from .account_connection import AccountConnection, game_start_error
+except ModuleNotFoundError as exc:
+    if exc.name != __package__ + ".account_connection":
+        raise
+    # The portable client omits the disabled workbench account inspector.
+    AccountConnection = None
+    def game_start_error(device):
+        return None
+from .library import WorkbenchLibrary
+from packages.lb_core import adb, displays, emulators
+from packages.lb_core.materials import new_material_id
+from packages.lb_core.screenshots import Screenshot
+
+
+ACCOUNT_RESOURCES_ENABLED = False
+
+
+def _adb_path(client="workbench") -> str:
+    settings = DATA / client / "device-settings.json"
+    try:
+        saved = json.loads(settings.read_text(encoding="utf-8"))
+        if isinstance(saved, dict) and saved.get("adb_path"):
+            return adb.find_adb(saved["adb_path"])
+    except (adb.AdbError, OSError, ValueError, TypeError):
+        pass
+    return adb.find_adb()
+
+
+def _preview(png: bytes) -> str:
+    with Image.open(BytesIO(png)) as frame:
+        output = BytesIO()
+        frame.convert("RGB").save(output, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _binding(target: dict) -> tuple:
+    return (target["package"], target["user_id"], target["display_id"], target["native_display_id"])
+
+
+class DeviceSession:
+    def __init__(self, client="workbench"):
+        self.client = client
+        self.account = None
+        self.draft = None
+        self.job = None
+        self.ocr_worker = None
+        self.releases = {}
+        self.disconnect()
+
+    def disconnect(self):
+        if self.account:
+            self.account.close()
+            self.account = None
+        if self.job:
+            self.job.stop(wait=True)
+            self._retire_job()
+        self.device = None
+        self.adb_path = None
+        self.binding = None
+        self.first_frame = None
+        self.token = None
+
+    def discover(self):
+        discover = emulators.discover_mumu_instances if self.client == "liaoban" else emulators.discover_emulators
+        return [
+            {"id": row["id"], "name": row["name"], "address": row["address"] or "", "state": row["status"]}
+            for row in discover(_adb_path(self.client))
+        ]
+
+    def connect(self, instance_id: str):
+        self.disconnect()
+        executable = _adb_path(self.client)
+        device = emulators.connect_emulator(executable, instance_id)
+        waiting = False
+        game_launched = False
+        try:
+            target, shot = displays.capture_game_screenshot(executable, device["address"], mumu=device["mumu"])
+        except adb.AdbError as exc:
+            if self.client == "liaoban" and isinstance(exc, displays.GameWindowPending):
+                waiting = True
+                game_launched = emulators.ensure_onmyoji_running(executable, device)
+            else:
+                reason = game_start_error(device)
+                if reason:
+                    raise adb.AdbError(reason) from exc
+                raise
+        self.device, self.adb_path = device, executable
+        self.token = new_material_id()
+        if not waiting:
+            self._attach_game(target, shot)
+        info = self.connection_info()
+        if waiting:
+            info["gameLaunched"] = game_launched
+        return info
+
+    def _attach_game(self, target, shot):
+        self.first_frame = _preview(shot.png)
+        self.binding = _binding(target)
+        self.source_size = shot.source_size
+        if ACCOUNT_RESOURCES_ENABLED:
+            self.account = AccountConnection(self.device, self.adb_path, self.binding, shot.png)
+
+    def connection_info(self):
+        return {"name": self.device["name"], "address": self.device["address"], "displayId": self.binding[2] if self.binding else None,
+                "accountResourcesEnabled": self.account is not None}
+
+    def _current_mumu(self):
+        selected = next((row for row in emulators.discover_mumu_instances(self.adb_path)
+                         if row["id"] == self.device["id"]), None)
+        if not selected or selected["address"] != self.device["address"]:
+            raise adb.AdbError("模拟器地址已变化，请重新连接")
+        return selected
+
+    def attach_game(self, token):
+        if not self.token or self.token != token:
+            raise ValueError("设备连接已变化，请重新连接")
+        if self.binding is None:
+            selected = self._current_mumu()
+            try:
+                target, shot = displays.capture_game_screenshot(self.adb_path, selected["address"], mumu=selected["mumu"])
+            except displays.GameWindowPending:
+                return self.connection_info()
+            self._attach_game(target, shot)
+        return self.connection_info()
+
+    def account_connection(self, token):
+        account = self.account
+        if self.token is None or self.token != token:
+            raise ValueError("设备连接已变化，请重新选择设备")
+        if account is None:
+            raise ValueError("工作台账号资源读取已停用")
+        return account
+
+    def _retire_job(self):
+        if self.job.state.get("release") is not None:
+            self.releases[self.job.address] = self.job.state["release"]
+        self.job.stop()
+        self.job = None
+
+    def start_operation(self, payload):
+        from .operation_process import OperationJob, spawn_worker
+        from packages.lb_core.materials import valid_id
+        config = payload["config"]
+        ocr = config.get("mode") == "ocr"
+        saved = payload.get("frameSource") == "saved"
+        if saved and (not ocr or config.get("ocrRun", "once") != "once"):
+            raise ValueError("来源截图仅支持单次 OCR 试读")
+        if not saved and (not self.device or payload.get("token") != self.token):
+            raise ValueError("设备连接已变化，请重新选择设备")
+        if not saved and (not self.device.get("mumu") or not self.device["mumu"].get("dll") or not self.binding or self.binding[3] is None):
+            raise ValueError("操作测试需要已连接的 MuMu 原生截图组件")
+        if self.client == "liaoban" and not saved:
+            self._current_mumu()
+        if not valid_id(payload.get("id")):
+            raise ValueError("测试编号无效")
+        if self.job:
+            if self.job.state["status"] not in ("starting", "running"):
+                self.job.stop(wait=True)
+            if self.job.reader.is_alive():
+                raise ValueError("上一项操作仍在运行")
+            self._retire_job()
+        request = dict(client=self.client, jobId=payload["id"], config=config, preview=payload.get("preview") is True, device=self.device,
+                       cropPreview=ocr and payload.get("cropPreview") is True,
+                       frameSource="saved" if saved else "live", adb=self.adb_path, binding=self.binding,
+                       size=None if saved else self.source_size,
+                       previousRelease=None if saved else self.releases.get(self.device["address"]))
+        if self.client == "liaoban" and not ocr:
+            request["contentRoot"] = payload.get("contentRoot")
+            request["releaseVersion"] = payload.get("releaseVersion")
+            request["memberToken"] = payload.get("memberToken")
+        if ocr and (self.ocr_worker is None or self.ocr_worker.poll() is not None):
+            if self.ocr_worker:
+                self.ocr_worker.stdin.close()
+                self.ocr_worker.stdout.close()
+            self.ocr_worker = spawn_worker(resident=True)
+        self.job = OperationJob(payload["id"], request, self.ocr_worker if ocr else None)
+        return self.job.state
+
+    def operation_state(self, job_id, stop=False):
+        if not self.job or (job_id is not None and job_id != self.job.id):
+            return {"status":"stopped","condition":"测试已结束","samples":0,"executed":0}
+        if stop:
+            self.job.stop()
+        return self.job.state
+
+    def _read_screenshot(self) -> Screenshot:
+        if self.device is None:
+            raise adb.AdbError("尚未连接模拟器，请选择设备。")
+        try:
+            target, shot = displays.capture_game_screenshot(
+                self.adb_path, self.device["address"], mumu=self.device["mumu"]
+            )
+            if _binding(target) != self.binding:
+                raise adb.AdbError("阴阳师所在的显示屏已切换，请重新连接。")
+            return shot
+        except displays.GameWindowPending:
+            raise
+        except Exception:
+            self.disconnect()
+            raise
+
+    def frame(self) -> str | None:
+        if self.first_frame is not None:
+            first, self.first_frame = self.first_frame, None
+            return first
+        try:
+            return _preview(self._read_screenshot().png)
+        except displays.GameWindowPending:
+            return None
+
+    def capture(self, library, batch_id=None):
+        shot = self._read_screenshot()
+        return library.add_capture(shot, self.device["name"], batch_id=batch_id)
+
+    def freeze(self):
+        shot = self._read_screenshot()
+        token = new_material_id()
+        self.draft = (token, shot, self.device["name"])
+        return {"token": token, "image": "data:image/png;base64," + base64.b64encode(shot.png).decode("ascii")}
+
+    def test_recognition(self, library, payload, on_progress=None):
+        from packages.lb_core.recognition import recognize_templates
+
+        name, variants = library.recognition_templates(payload["captureId"], payload["id"], payload["revision"])
+        shot = self._read_screenshot()
+        captured_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        result = recognize_templates(shot.png, variants, on_progress)
+        return dict(result, name=name, device=self.device["name"], captured_at=captured_at,
+                    image="data:image/png;base64," + base64.b64encode(shot.png).decode("ascii"))
+
+    def discard(self, token):
+        if self.draft and token == self.draft[0]:
+            self.draft = None
+
+    def confirm(self, library, token, fields):
+        if self.draft is None or self.draft[0] != token:
+            raise ValueError("这张定格画面已失效，请重新截取")
+        result = library.add_marked_capture(self.draft[1], self.draft[2], fields)
+        self.discard(token)
+        return result
+
+
+def main():
+    session = DeviceSession("liaoban" if sys.argv[1:] == ["liaoban"] else "workbench")
+    library = None
+    navigation = None
+    output_lock = Lock()
+    def emit(value):
+        with output_lock:
+            print(json.dumps(value, ensure_ascii=False), flush=True)
+
+    def reply_async(request_id, operation, *args):
+        try:
+            result = operation(*args)
+            response = {"id": request_id, "result": result}
+        except Exception as exc:
+            response = {"id": request_id, "error": str(exc)}
+        emit(response)
+
+    preview_thread = None
+    for line in sys.stdin:
+        request_id = None
+        try:
+            request = json.loads(line)
+            request_id = request["id"]
+            method = request["method"]
+            payload = request.get("payload", request.get("selectedId"))
+            # A resource request has its own bound channel. It can run while the
+            # preview encodes PNG/JPEG; other device operations retain FIFO ordering.
+            if preview_thread and method not in ("accountStatus", "readResources", "readAccountDisplay"):
+                preview_thread.join()
+                preview_thread = None
+            if method == "discover":
+                result = session.discover()
+            elif method == "powerDevice" and session.client == "liaoban":
+                result = emulators.control_mumu(_adb_path(session.client), payload["deviceId"], payload["action"])
+            elif method == "adbSettings" and session.client == "liaoban":
+                result = _adb_path(session.client)
+            elif method == "setAdb" and session.client == "liaoban":
+                if session.device:
+                    raise ValueError("请先断开模拟器")
+                result = adb.find_adb(payload)
+                settings = DATA / "liaoban/device-settings.json"
+                settings.parent.mkdir(parents=True, exist_ok=True)
+                temporary = settings.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"adb_path":result},ensure_ascii=False),"utf8")
+                temporary.replace(settings)
+            elif method == "previewPreset" and session.client == "liaoban":
+                if not session.token or session.token != payload.get("token"):
+                    raise ValueError("请重新连接设备")
+                if session.job and session.job.state["status"] in ("starting", "running"):
+                    raise ValueError("请在任务结束后预览")
+                from apps.liaoban.content_runtime import read_preset
+                result = read_preset(session._read_screenshot().png, payload)
+            elif method == "connect" or (method == "attachGame" and session.client == "liaoban"):
+                info = session.connect(payload) if method == "connect" else session.attach_game(payload)
+                result = dict(info, token=session.token)
+                if session.client == "liaoban" and session.binding and session.binding[3] is not None:
+                    result["previewSource"] = {
+                        "mumu": session.device["mumu"], "package": session.binding[0],
+                        "display": session.binding[3],
+                    }
+            elif method == "accountStatus":
+                result = session.account_connection(payload["token"]).state
+            elif method == "readAccountDisplay":
+                account = session.account_connection(payload["token"])
+                Thread(target=reply_async, args=(request_id, account.read_display), daemon=True).start()
+                continue
+            elif method == "readResources":
+                account = session.account_connection(payload["token"])
+                Thread(target=reply_async, args=(request_id, account.read, payload.get("resources")), daemon=True).start()
+                continue
+            elif method == "startOperation":
+                result = session.start_operation(payload)
+            elif method in ("operationStatus", "stopOperation"):
+                result = session.operation_state(payload, stop=method == "stopOperation")
+            elif method == "pauseOperation" and session.client == "liaoban":
+                job = session.job
+                if not job or job.id != payload["id"] or job.state["status"] not in ("running","starting"):
+                    raise ValueError("任务已结束")
+                job.set_pause(payload["paused"])
+                result = None
+            elif method == "freeze":
+                result = session.freeze()
+            elif method == "discard":
+                result = session.discard(payload)
+            elif method == "frame":
+                preview_thread = Thread(target=reply_async, args=(request_id, session.frame), daemon=True)
+                preview_thread.start()
+                continue
+            elif method == "disconnect":
+                result = session.disconnect()
+            elif method in ("capture", "testRecognition", "batchFrame", "saveBatch", "captures", "materials", "annotations", "confirm", "appendTemplates", "updateTemplate", "deleteAnnotation", "navigation", "updateNavigation"):
+                if library is None:
+                    library = WorkbenchLibrary(DATA / "workbench")
+                if method in ("navigation", "updateNavigation"):
+                    from .navigation import NavigationStore
+                    if navigation is None:
+                        navigation = NavigationStore(library)
+                    result = navigation.load() if method == "navigation" else navigation.update(payload)
+                elif method == "capture":
+                    result = session.capture(library)
+                elif method == "testRecognition":
+                    def report_progress(done, total):
+                        emit({"id": request_id, "progress": [done, total]})
+                    result = session.test_recognition(library, payload, report_progress)
+                elif method == "batchFrame":
+                    result = session.capture(library, payload)
+                elif method == "saveBatch":
+                    result = library.save_batch(payload["batchId"], payload["requestId"], payload["frames"])
+                elif method == "captures":
+                    result = library.list_captures()
+                elif method == "materials":
+                    result = library.list_materials()
+                elif method == "appendTemplates":
+                    result = library.append_annotations(payload["captureId"], payload["fields"])
+                elif method == "deleteAnnotation":
+                    result = library.delete_annotation(payload["captureId"], payload["id"], payload["revision"])
+                elif method == "confirm":
+                    result = session.confirm(library, payload["token"], payload["fields"])
+                elif method == "updateTemplate":
+                    result = library.update_annotation(payload["captureId"], payload["id"], payload["revision"], payload["fields"])
+                else:
+                    result = library.list_annotations(payload)
+            else:
+                raise ValueError("未知的设备请求。")
+            response = {"id": request_id, "result": result}
+        except Exception as error:
+            response = {"id": request_id, "error": str(error) or "设备操作失败，请重试。"}
+        emit(response)
+    if preview_thread:
+        preview_thread.join()
+    session.disconnect()
+    if session.ocr_worker:
+        session.ocr_worker.stdin.close()
+        session.ocr_worker.wait()
+        session.ocr_worker.stdout.close()
+
+
+if __name__ == "__main__":
+    main()

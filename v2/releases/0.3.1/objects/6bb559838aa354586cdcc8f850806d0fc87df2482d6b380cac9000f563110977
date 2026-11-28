@@ -1,0 +1,107 @@
+"""Build the workbench directory from the same graph used to navigate."""
+
+from collections import defaultdict
+
+from packages.lb_core.navigation_catalog import PAGE_IDS
+from packages.lb_core.navigation_dungeons import DungeonScenes
+
+
+def directory_view(catalog, materials):
+    pages = {PAGE_IDS.get(p["id"], p["id"]): p for p in catalog.pages}
+    rules = catalog.data["rules"]
+    assets = {v["id"]: m["id"] for m in materials for v in m["variants"]}
+    names = {m["id"]: m["name"] for m in materials}
+    aliases = defaultdict(list)
+    for alias, scene in catalog.aliases.items():
+        aliases[scene].append(alias)
+
+    def ref(key):
+        if key.startswith(("w:", "f:")):
+            return key
+        rid = rules.get(key, {}).get("id", key)
+        return "f:" + assets.get(rid, rid)
+
+    def describe(control):
+        keys = []
+        if control is None:
+            label = "识别当前状态"
+        elif control in ("0020", "f:" + rules["0020"]["id"], "w:" + rules["0020"]["id"]):
+            label, keys = "确认庭院卷轴状态后点击标注区域", [control]
+        elif control in ("home_daily", "f:" + rules["home_daily"]["id"]):
+            label = "识别庭院轮换图标，打开日常"
+            keys = [a["icon"] for a in catalog.daily_activities.values()] + ["home_daily"]
+        elif control == "enter_explore":
+            label, keys = "识别庭院探索入口", ["home_lantern", *catalog.data["explore_group"]]
+        elif control.startswith("find_chapter:"):
+            label, keys = "滚动查找章节，进入后用 OCR 核对标题", ["xp_chapter_marker", "xp_chapter_button"]
+        elif control.startswith("find_daily:"):
+            activity = catalog.daily_activities[control.split(":")[1]]
+            label, keys = "查找当天卡片并点击参加", [activity["icon"], "daily_join", "daily_practice", "daily_closed"]
+        elif control.startswith("find_level:"):
+            _, family, number = control.split(":")
+            key = "dp_" + DungeonScenes.level_key(family, int(number))
+            keys = ["dp_tab_" + family, key]
+            if key + "_selected" in rules:
+                keys.append(key + "_selected")
+            label = "查找层名，核对副本和选中标记"
+        elif control == "daily_exit":
+            label, keys = "识别返回或关闭按钮", ["0232", "0230"]
+        elif control.startswith("domain:"):
+            action = control.split(":")[1]
+            if action == "realm_opponent":
+                label, keys = "选择可挑战的对手", ["dp_realm_card_corner", "dp_realm_defeated"]
+            elif action == "boss_first":
+                label, keys = "选择首张对手卡片", ["dp_boss_card"]
+            elif action in catalog.data["regions"]:
+                label = "确认当前界面后点击关闭区域"
+            else:
+                label = control
+        else:
+            keys = [control]
+            label = rules.get(control, {}).get("name") or names.get(ref(control)[2:]) or "点击关联素材"
+        return {"name": label, "refs": list(dict.fromkeys(ref(k) for k in keys))}
+
+    controls = {}
+    edges = {}
+    for source, outgoing in catalog.graph.items():
+        dests = {}
+        for dest, control in outgoing:
+            key = control or ""
+            if key not in controls:
+                controls[key] = describe(control)
+            methods = dests.setdefault(dest, [])
+            if key not in methods:
+                methods.append(key)
+        edges[source] = dests
+
+    directory = {}
+    features = {row["id"]: row["features"] for row in catalog.data["menu"]}
+    start = "courtyard_closed"
+    for scene in dict.fromkeys([*catalog.paths, *pages, *edges, *(d for row in edges.values() for d in row)]):
+        page = pages.get(scene, {})
+        path = catalog.paths.get(scene, "")
+        name = page.get("name") or path.partition("/")[2] or path or catalog.labels.get(scene, scene)
+        section = page.get("section") or (path.split("/")[0] if path else "过渡界面")
+        activity = catalog.daily_activities.get(scene.removeprefix("daily_")) if scene.startswith("daily_") else None
+        keys = list(features.get(scene, []))
+        if scene in rules:
+            keys.append(scene)
+        if activity:
+            suffix = scene.removeprefix("daily_")
+            keys.extend(k for k in ("daily_title_" + suffix, "daily_proof_" + suffix) if k in rules)
+        linked = [ref(k) for k in keys]
+        if scene.startswith("chapter-") and scene[8:].isdigit():
+            linked.extend(controls.get("find_chapter:" + scene[8:], {}).get("refs", []))
+        if scene.startswith("souls_") and scene.rsplit("_", 1)[-1].isdigit():
+            family, level = scene.removeprefix("souls_").rsplit("_", 1)
+            linked.extend(controls.get(f"find_level:{family}:{level}", {}).get("refs", []))
+        route = None
+        if path:
+            try:
+                route = [d for _, d, _ in catalog.route(start, scene)]
+            except ValueError:
+                pass  # A locally edited destination can lack a route from this particular start.
+        directory[scene] = dict(id=scene, name=name, path=path, section=section, aliases=aliases[scene], route=route,
+                                pageId=page.get("id"), refs=list(dict.fromkeys(linked)),
+                                availability=activity["availability"] if activity else None)
+    return dict(directory=directory, edges=edges, controls=controls, routeStart=start)

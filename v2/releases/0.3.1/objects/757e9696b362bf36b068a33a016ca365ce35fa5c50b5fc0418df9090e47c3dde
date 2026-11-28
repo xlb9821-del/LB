@@ -1,0 +1,78 @@
+"""Reader for the signed customer content format. One revision per task process."""
+import base64
+import hashlib
+import importlib.abc
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+TRUST = Path(__file__).with_name("release-trust.json")
+MODULES = {"packages.lb_core." + name for name in (
+    "battle", "chapter", "chapter_setup", "flow_session", "navigation", "navigation_catalog",
+    "navigation_daily", "navigation_dungeons", "navigation_vision", "personal_realm", "regional_boss", "picture_scroll", "team_preset"
+)} | {"apps.workbench.navigation_run", "apps.liaoban.preset_preview"}
+_catalog = None
+
+
+def unpack_signed(envelope, public):
+    data = base64.b64decode(envelope["payload"], validate=True)
+    key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public, validate=True))
+    key.verify(base64.b64decode(envelope["signature"], validate=True), data)
+    return json.loads(data)
+
+
+class GameplayModule(importlib.abc.SourceLoader):
+    def __init__(self, catalog, name):
+        self.catalog = catalog
+        self.file = catalog.root / (name.replace(".", "/") + ".py")
+
+    def get_filename(self, fullname):
+        return str(self.file)
+
+    def get_data(self, filename):
+        if Path(filename) != self.file:
+            raise OSError("该玩法没有字节码缓存")
+        return self.catalog.read(self.file)
+
+
+class GameCatalog(importlib.abc.MetaPathFinder):
+    def __init__(self, root, key, trust):
+        self.root = Path(root).resolve(strict=True)
+        manifest = unpack_signed(json.loads((self.root / "index.json").read_bytes()), trust["update"])
+        if (manifest.get("product"), manifest.get("format"), manifest.get("engine"), manifest.get("keyId")) != (
+                "liaoban-content", 2, 2, trust["keyId"]):
+            raise ValueError("加密内容版本与引擎不匹配")
+        self.files = {row["name"]: row for row in manifest["files"]}
+        self.cipher = AESGCM(key)
+
+    def read(self, path):
+        name = path.relative_to(self.root).as_posix()
+        row = self.files[name]
+        blob = (self.root / "objects" / row["sha256"]).read_bytes()
+        if len(blob) != row["size"] or hashlib.sha256(blob).hexdigest() != row["sha256"]:
+            raise ValueError("内容文件校验失败")
+        return self.cipher.decrypt(blob[:12], blob[12:], ("liaoban-content-v2/" + name).encode())
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in MODULES:
+            loader = GameplayModule(self, fullname)
+            return importlib.util.spec_from_file_location(fullname, loader.get_filename(fullname), loader=loader)
+        return None
+
+
+def activate(root, key, trust):
+    global _catalog
+    if _catalog or MODULES.intersection(sys.modules):
+        raise RuntimeError("请在新的玩法进程中加载版本")
+    _catalog = GameCatalog(root, key, trust)
+    sys.meta_path.insert(0, _catalog)
+
+
+def read_game_file(path):
+    if _catalog and path.is_relative_to(_catalog.root):
+        return _catalog.read(path)
+    return path.read_bytes()

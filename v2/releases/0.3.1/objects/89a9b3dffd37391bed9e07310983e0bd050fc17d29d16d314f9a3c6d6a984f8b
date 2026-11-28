@@ -1,0 +1,517 @@
+"""Workbench-owned source captures and annotations, separate from released assets."""
+
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from PIL import Image
+
+from packages.lb_core.materials import (
+    CANVAS_SIZE, default_search_rect, new_material_id, normalized_rect, pixel_rect, ratio_rect, valid_id,
+)
+from packages.lb_core.screenshots import Screenshot
+
+
+def _timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@contextmanager
+def _edit_lock(folder):
+    # Lock a separate handle so the actual descriptor can be atomically replaced.
+    # The file can be reused; the OS releases the lock when its owner exits.
+    with (folder / ".edit.lock").open("a+b") as handle:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except PermissionError as exc:
+                raise ValueError("这条标注正在被其他窗口修改，请稍后重试") from exc
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("这条标注正在被其他窗口修改，请稍后重试") from exc
+        yield
+
+
+def _validated_text(name, note):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("请填写标注名称")
+    if not isinstance(note, str):
+        raise ValueError("标注用途应为文字")
+    return name.strip(), note.strip()
+
+
+def _write(path, record):
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _range_from(fields, key):
+    if key + "_ratio" in fields:
+        return ratio_rect(fields[key + "_ratio"])
+    # Pre-ratio records used pixels on the standard work image, even for a
+    # capture whose original.png had a different resolution.
+    return normalized_rect(fields.get(key))
+
+
+def _canonical_mark(record):
+    row = dict(record)
+    row["rect_ratio"] = _range_from(row, "rect")
+    if row.get("search_rect_ratio") is not None or row.get("search_rect") is not None:
+        row["search_rect_ratio"] = _range_from(row, "search_rect")
+    else:
+        row["search_rect_ratio"] = [0, 0, 1, 1] if row["kind"] == "template" else None
+    row.pop("rect", None)
+    row.pop("search_rect", None)
+    return row
+
+
+def _legacy_view(row):
+    """Old callers can still read standard-canvas pixels from API results."""
+    roi = row.get("search_rect_ratio")
+    return dict(row, note=row.get("note", ""), search_rect_ratio=roi, rect=list(pixel_rect(row["rect_ratio"], CANVAS_SIZE)),
+                search_rect=list(pixel_rect(roi, CANVAS_SIZE)) if roi is not None else None)
+
+
+def _template_settings(fields):
+    if fields.get("kind", "template") != "template":
+        raise ValueError("请选择模板素材")
+    name, note = _validated_text(fields["name"], fields["note"])
+    crop = _range_from(fields, "rect")
+    roi = _range_from(fields, "search_rect")
+    if not (roi[0] <= crop[0] and roi[1] <= crop[1] and roi[2] >= crop[2] and roi[3] >= crop[3]):
+        raise ValueError("搜索范围需要包含整个目标框")
+    threshold = fields["threshold"]
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+        raise ValueError("匹配阈值需要在 0 到 1 之间")
+    if fields["method"] != "template_match":
+        raise ValueError("当前支持模板匹配")
+    return dict(name=name, note=note, rect_ratio=crop, search_rect_ratio=roi,
+                threshold=threshold, method="template_match")
+
+
+def _mark_settings(fields):
+    if fields.get("kind") == "ocr":
+        name, _ = _validated_text(fields.get("name"), "")
+        layout = fields.get("ocr_layout", "line")
+        if layout not in ("line", "block"):
+            raise ValueError("请选择有效的 OCR 读取方式")
+        return dict(kind="ocr", name=name, rect_ratio=_range_from(fields, "rect"), ocr_layout=layout)
+    if fields.get("kind") == "tap":
+        name, _ = _validated_text(fields.get("name"), "")
+        return dict(kind="tap", name=name, rect_ratio=_range_from(fields, "rect"))
+    return dict(kind="template", **_template_settings(fields))
+
+
+def _commit(folder, stage, metadata_file, record, payload_names):
+    """Publish all the files together. Readers ignore private staging directories."""
+    while True:
+        code = new_material_id()
+        dest = folder / code
+        record["id"] = code
+        for field, filename in payload_names.items():
+            record[field] = (Path(folder.name) / code / filename).as_posix()
+        _write(stage / metadata_file, record)
+        try:
+            stage.rename(dest)
+            return record
+        except OSError:
+            # Each committed directory is nonempty, so rename cannot replace it.
+            if not dest.exists():
+                raise
+
+
+class WorkbenchLibrary:
+    def __init__(self, root: Path):
+        self.root = Path(root).resolve()
+        self.captures = self.root / "captures"
+        self.annotations = self.root / "annotations"
+        self.captures.mkdir(parents=True, exist_ok=True)
+        self.annotations.mkdir(parents=True, exist_ok=True)
+
+    def _capture(self, capture_id):
+        if not valid_id(capture_id):
+            raise ValueError("无效的截图编号")
+        path = self.captures / capture_id
+        if not (path / "capture.json").is_file():
+            raise ValueError("找不到这张截图")
+        return path
+
+    def list_captures(self):
+        rows = self.list_materials()
+        for row in rows:
+            marks = row.pop("marks")
+            if "primary_annotation_id" in row:
+                primary = next((m for m in marks if m["id"] == row["primary_annotation_id"]), None)
+                if primary:
+                    row["mark_name"] = primary["name"]
+                    if primary.get("template"):
+                        row["mark_template"] = primary["template"]
+                else:
+                    row.pop("primary_annotation_id")
+        return rows
+
+    def list_materials(self):
+        captures = {p.parent.name: _read(p) for p in self.captures.glob("*/capture.json")
+                    if valid_id(p.parent.name)}
+        for capture in captures.values():
+            capture["marks"] = []
+        commits = {}
+        for path in self.annotations.glob("*/*.json"):
+            capture = captures.get(path.stem)
+            if capture is not None and valid_id(path.parent.name):
+                mark = self._visible_mark(path, capture, commits)
+                if mark:
+                    capture["marks"].append(_legacy_view(mark))
+        for capture in captures.values():
+            capture["marks"].sort(key=lambda m: (m["created_at"], m["id"]))
+        return sorted(captures.values(), key=lambda c: (c["created_at"], c["id"]), reverse=True)
+
+    def _visible_mark(self, path, capture, commits=None):
+        try:
+            mark = _read(path)
+        except FileNotFoundError:
+            return None  # Another window deleted this mark during enumeration.
+        if mark.get("grouped") and mark["id"] not in capture.get("annotation_ids", []):
+            return None
+        commit = mark.get("batch_commit")
+        if commit:
+            commits = {} if commits is None else commits
+            if commit not in commits:
+                receipt = self.root / "batch-commits" / (commit + ".json")
+                commits[commit] = _read(receipt)["marks"] if receipt.is_file() else {}
+            if mark["id"] not in commits[commit]:
+                return None
+        return _canonical_mark(mark)
+
+    def add_capture(self, png_bytes: bytes | Screenshot, source: str, *, batch_id=None):
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("截图需要注明来源")
+        shot = png_bytes if isinstance(png_bytes, Screenshot) else Screenshot.from_png(png_bytes)
+        width, height = shot.source_size
+        record = {"source": source.strip(), "width": width, "height": height,
+                  "created_at": _timestamp()}
+        if batch_id is not None:
+            if not valid_id(batch_id):
+                raise ValueError("无效的图片集编号")
+            record["batch_id"] = batch_id
+        with TemporaryDirectory(dir=self.captures, prefix=".pending-") as staging:
+            stage = Path(staging) / "entry"
+            stage.mkdir()
+            (stage / "original.png").write_bytes(shot.original_png)
+            (stage / "canvas.png").write_bytes(shot.png)
+            return _commit(self.captures, stage, "capture.json", record,
+                           {"original": "original.png", "preview": "canvas.png"})
+
+    def preview_path(self, capture_id):
+        return self._capture(capture_id) / "canvas.png"
+
+    def list_annotations(self, capture_id):
+        capture = _read(self._capture(capture_id) / "capture.json")
+        # Using the source ID in each descriptor filename lets readers skip
+        # unrelated records without parsing their metadata or loading any PNG.
+        rows = [_legacy_view(mark) for path in self.annotations.glob(f"*/{capture_id}.json")
+                if valid_id(path.parent.name) and (mark := self._visible_mark(path, capture))]
+        return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
+
+    def recognition_templates(self, capture_id, annotation_id, revision):
+        from packages.lb_core.recognition import TemplateVariant
+
+        if not valid_id(annotation_id):
+            raise ValueError("无效的模板编号")
+        capture = _read(self._capture(capture_id) / "capture.json")
+        mark = self._visible_mark(self.annotations / annotation_id / (capture_id + ".json"), capture)
+        if not mark or mark["kind"] != "template":
+            raise ValueError("请选择已保存的模板素材")
+        if mark.get("revision", 0) != revision:
+            raise ValueError("模板配置已变更，请刷新素材后重试")
+        rows = [mark]
+        if mark.get("group_id"):
+            rows = [m for source in self.list_materials() for m in source["marks"]
+                    if m.get("group_id") == mark["group_id"] and m["kind"] == "template"]
+        variants = []
+        for row in rows:
+            relative = Path(row.get("template") or "")
+            expected = Path("annotations") / row["id"]
+            path = None
+            if relative.parent == expected and re.fullmatch(r"template(?:-\d+)?\.png", relative.name):
+                path = self.root / relative
+            variants.append(TemplateVariant(row["id"], row["name"], path, row["search_rect_ratio"], row.get("threshold", .85)))
+        return mark.get("group_name") or mark["name"], variants
+
+    def tap_region(self, annotation_id, revision=None):
+        return self.area_annotation(annotation_id, "tap", revision)["rect_ratio"]
+
+    def area_annotation(self, annotation_id, kind, revision=None):
+        label = {"tap": "盲点", "ocr": "OCR 文字区"}[kind]
+        if not valid_id(annotation_id):
+            raise ValueError(f"请选择已标注的{label}")
+        for path in (self.annotations / annotation_id).glob("*.json"):
+            if not valid_id(path.stem):
+                continue
+            capture = self.captures / path.stem / "capture.json"
+            if capture.is_file():
+                mark = self._visible_mark(path, _read(capture))
+                if mark and mark["kind"] == kind:
+                    if revision is not None and mark.get("revision", 0) != revision:
+                        raise ValueError(f"{label}已修改，请刷新后核对范围")
+                    return mark
+        raise ValueError(f"所选{label}不存在或已删除，请刷新后重新选择")
+
+    def add_annotation(self, capture_id, kind, name, note, rect=None, search_rect=None, *,
+                       rect_ratio=None, search_rect_ratio=None):
+        canvas = self.preview_path(capture_id)
+        if kind not in ("template", "ocr", "tap"):
+            raise ValueError("请选择 UI 模板、OCR 文字区或盲点区域")
+        name, note = _validated_text(name, note)
+        crop = ratio_rect(rect_ratio) if rect_ratio is not None else normalized_rect(rect)
+        search = None
+        if kind == "template":
+            if search_rect_ratio is not None:
+                search = ratio_rect(search_rect_ratio)
+            elif search_rect is not None:
+                search = normalized_rect(search_rect)
+            elif rect_ratio is None:
+                search = normalized_rect(default_search_rect(rect))
+            else:
+                search = [0, 0, 1, 1]
+            if not (search[0] <= crop[0] and search[1] <= crop[1]
+                    and search[2] >= crop[2] and search[3] >= crop[3]):
+                raise ValueError("搜索范围需要包含整个模板选框")
+        elif search_rect is not None or search_rect_ratio is not None:
+            raise ValueError("只有 UI 模板可以设置搜索范围")
+        record = {"capture_id": capture_id, "kind": kind, "name": name,
+                  "note": note, "created_at": _timestamp(),
+                  "rect_ratio": crop, "search_rect_ratio": search}
+        with TemporaryDirectory(dir=self.annotations, prefix=".pending-") as staging:
+            stage = Path(staging) / "entry"
+            stage.mkdir()
+            payload = {}
+            if kind == "template":
+                with Image.open(canvas) as image, image.crop(pixel_rect(crop, image.size)) as template:
+                    template.save(stage / "template.png", format="PNG")
+                payload["template"] = "template.png"
+            return _legacy_view(_commit(self.annotations, stage, f"{capture_id}.json", record, payload))
+
+    def rename_annotation(self, capture_id, annotation_id, name, note, *, expected_name, expected_note):
+        self._capture(capture_id)
+        if not valid_id(annotation_id):
+            raise ValueError("无效的标注编号")
+        name, note = _validated_text(name, note)
+        folder = self.annotations / annotation_id
+        descriptor = folder / f"{capture_id}.json"
+        if not descriptor.is_file():
+            raise ValueError("找不到这张截图中的该条标注")
+        with _edit_lock(self._capture(capture_id)):
+            row = _canonical_mark(_read(descriptor))
+            if row["name"] != expected_name or row.get("note", "") != expected_note:
+                raise ValueError("名称或备注已在其他窗口修改，请重新打开这张截图后再保存")
+            row.update(name=name, note=note)
+            if "revision" in row:
+                row["revision"] += 1
+            with TemporaryDirectory(dir=folder, prefix=".edit-") as staging:
+                pending = Path(staging) / descriptor.name
+                _write(pending, row)
+                pending.replace(descriptor)
+            return _legacy_view(row)
+
+    def add_marked_capture(self, png, source, fields):
+        with TemporaryDirectory(dir=self.root, prefix=".pending-mark-") as staging:
+            pending = WorkbenchLibrary(staging)
+            capture = pending.add_capture(png, source)
+            marks = self._publish_marks(pending.captures / capture["id"], capture, fields, new_frame=True)
+            result = {**capture, "mark_name": marks[0]["name"]}
+            if marks[0].get("template"):
+                result["mark_template"] = marks[0]["template"]
+            if isinstance(fields, list):
+                result["marks"] = marks
+            return result
+
+    def append_annotations(self, capture_id, fields):
+        folder = self._capture(capture_id)
+        with _edit_lock(folder):
+            return self._publish_marks(folder, _read(folder / "capture.json"), fields)
+
+    append_templates = append_annotations
+
+    def _stage_mark(self, staged, image, capture_id, settings, **metadata):
+        mark_id = new_material_id()
+        while (staged / mark_id).exists() or (self.annotations / mark_id).exists():
+            mark_id = new_material_id()
+        entry = staged / mark_id
+        entry.mkdir()
+        mark = dict(settings, id=mark_id, capture_id=capture_id, revision=1, created_at=_timestamp(), **metadata)
+        if mark["kind"] == "template":
+            mark["template"] = f"annotations/{mark_id}/template.png"
+            with image.crop(pixel_rect(settings["rect_ratio"], image.size)) as crop:
+                crop.save(entry / "template.png", format="PNG")
+        _write(entry / f"{capture_id}.json", mark)
+        return mark
+
+    def save_batch(self, batch_id, request_id, frames):
+        if not valid_id(batch_id) or not valid_id(request_id) or not isinstance(frames, dict) or not frames:
+            raise ValueError("请选择图片集并框选素材")
+        receipts = self.root / "batch-commits"
+        receipts.mkdir(exist_ok=True)
+        receipt = receipts / (request_id + ".json")
+        digest = hashlib.sha256(json.dumps([batch_id, frames], sort_keys=True).encode()).hexdigest()
+        with _edit_lock(receipts), TemporaryDirectory(dir=self.root, prefix=".batch-") as staging:
+            if receipt.exists():
+                saved = _read(receipt)
+                if saved["digest"] != digest:
+                    raise ValueError("这批草稿已保存，请重新打开图片集")
+                return [_legacy_view(mark) for mid, cid in saved["marks"].items()
+                        if (mark := self._visible_mark(self.annotations / mid / (cid + ".json"), {}, {request_id: saved["marks"]}))]
+            staged = Path(staging)
+            groups, marks = {}, []
+            for cid, fields in frames.items():
+                folder = self._capture(cid)
+                if _read(folder / "capture.json").get("batch_id") != batch_id:
+                    raise ValueError("所选截图不属于同一图片集")
+                if not isinstance(fields, list) or not fields:
+                    raise ValueError("每个提交的画面至少需要一个素材框")
+                seen = set()
+                with Image.open(folder / "canvas.png") as image:
+                    for field in fields:
+                        key = field.get("group_key")
+                        if type(key) is not int or key < 1 or key in seen:
+                            raise ValueError("同一帧的素材变体编号无效或重复")
+                        seen.add(key)
+                        settings = _template_settings(field)
+                        if key not in groups:
+                            groups[key] = (new_material_id(), settings["name"])
+                        group_id, group_name = groups[key]
+                        marks.append(self._stage_mark(staged, image, cid, settings, kind="template",
+                                                          group_id=group_id, group_name=group_name, batch_commit=request_id))
+            manifest = staged / "receipt.json"
+            _write(manifest, {"digest": digest, "marks": {m["id"]: m["capture_id"] for m in marks}})
+            published = []
+            try:
+                for mark in marks:
+                    dest = self.annotations / mark["id"]
+                    (staged / mark["id"]).rename(dest)
+                    published.append(dest)
+                manifest.replace(receipt)
+            except OSError:
+                for dest in published:
+                    dest.rename(staged / dest.name)
+                raise
+            return [_legacy_view(mark) for mark in marks]
+
+    def _publish_marks(self, folder, capture, fields, new_frame=False):
+        group = [fields] if isinstance(fields, dict) else fields
+        if not isinstance(group, list) or not group:
+            raise ValueError("请先框选至少一张素材")
+        settings = [_mark_settings(item) for item in group]
+        capture_id = capture["id"]
+        with TemporaryDirectory(dir=self.root, prefix=".pending-templates-") as staging:
+            staged = Path(staging)
+            marks = []
+            with Image.open(folder / "canvas.png") as image:
+                for item in settings:
+                    marks.append(self._stage_mark(staged, image, capture_id, item, grouped=True))
+            capture["annotation_ids"] = capture.get("annotation_ids", []) + [m["id"] for m in marks]
+            capture.setdefault("primary_annotation_id", marks[0]["id"])
+            manifest = staged / "capture.json"
+            _write(manifest, capture)
+            published = []
+            try:
+                for mark in marks:
+                    entry = self.annotations / mark["id"]
+                    (staged / mark["id"]).rename(entry)
+                    published.append(entry)
+                # The manifest makes the entire group visible in one operation.
+                manifest.replace(folder / "capture.json")
+                if new_frame:
+                    folder.rename(self.captures / capture_id)
+            except OSError:
+                for entry in published:
+                    entry.rename(staged / entry.name)
+                raise
+            return [_legacy_view(mark) for mark in marks]
+
+    def delete_annotation(self, capture_id, annotation_id, revision):
+        folder = self._capture(capture_id)
+        if not valid_id(annotation_id):
+            raise ValueError("无效的素材编号")
+        with _edit_lock(folder):
+            manifest = folder / "capture.json"
+            capture = _read(manifest)
+            entry = self.annotations / annotation_id
+            mark = self._visible_mark(entry / f"{capture_id}.json", capture)
+            if not mark or mark.get("revision", 0) != revision:
+                raise ValueError("素材已经变更或删除，请刷新素材后再试")
+            if "annotation_ids" in capture:
+                capture["annotation_ids"] = [i for i in capture["annotation_ids"] if i != annotation_id]
+            if capture.get("primary_annotation_id") == annotation_id:
+                capture.pop("primary_annotation_id")
+                for other in self.list_annotations(capture_id):
+                    if other["id"] != annotation_id:
+                        capture["primary_annotation_id"] = other["id"]
+                        break
+            with TemporaryDirectory(dir=self.root, prefix=".delete-mark-") as staging:
+                next_manifest = Path(staging) / "capture.json"
+                _write(next_manifest, capture)
+                removed = Path(staging) / annotation_id
+                entry.rename(removed)
+                try:
+                    next_manifest.replace(manifest)
+                except OSError:
+                    removed.rename(entry)
+                    raise
+
+    def update_annotation(self, capture_id, annotation_id, revision, fields):
+        canvas = self.preview_path(capture_id)
+        if not valid_id(annotation_id):
+            raise ValueError("无效的标记编号")
+        settings = _mark_settings(fields)
+        folder = self.annotations / annotation_id
+        descriptor = folder / (capture_id + ".json")
+        with _edit_lock(canvas.parent):
+            row = self._visible_mark(descriptor, _read(canvas.parent / "capture.json"))
+            if not row:
+                raise ValueError("这张素材已被删除，请刷新素材")
+            if row["kind"] != settings["kind"] or row.get("revision", 0) != revision:
+                raise ValueError("标记已经变更，请重新打开后编辑")
+            next_revision = revision + 1
+            with TemporaryDirectory(dir=folder, prefix=".edit-") as staging:
+                pending = Path(staging) / descriptor.name
+                replacement = None
+                if row["kind"] == "template" and settings["rect_ratio"] != row["rect_ratio"]:
+                    previous_image = self.root / row["template"]
+                    replacement = folder / f"template-{next_revision}.png"
+                    staged_image = Path(staging) / replacement.name
+                    with Image.open(canvas) as image, image.crop(pixel_rect(settings["rect_ratio"], image.size)) as crop:
+                        crop.save(staged_image, format="PNG")
+                    staged_image.replace(replacement)
+                    row["template"] = replacement.relative_to(self.root).as_posix()
+                row.update(**settings, revision=next_revision)
+                if row["kind"] in ("tap", "ocr"):
+                    row.pop("search_rect_ratio", None)
+                try:
+                    _write(pending, row)
+                    pending.replace(descriptor)
+                except OSError:
+                    if replacement:
+                        replacement.unlink(missing_ok=True)
+                    raise
+                if replacement and previous_image.parent == folder and previous_image.suffix == ".png":
+                    try:
+                        previous_image.unlink(missing_ok=True)
+                    except OSError:
+                        pass  # An older view may still be reading the prior crop.
+            return _legacy_view(row)
+
+    update_template = update_annotation
