@@ -1,0 +1,79 @@
+"""A task gets its own signed, challenge-bound permit over the production TLS connection."""
+import base64
+import hashlib
+import http.client
+import json
+import secrets
+import threading
+import time
+
+from .protected_content import TRUST, activate, unpack_signed
+
+
+def request_permit(token, task, nonce):
+    connection = http.client.HTTPSConnection("liaoban.onim.cloud", timeout=3)
+    try:
+        connection.request("POST", "/api/gameplay-permit", json.dumps({"task": task, "nonce": nonce}),
+                           {"Content-Type": "application/json", "Authorization": "Bearer " + token})
+        response = connection.getresponse()
+        data = response.read(8193)
+        if response.status != 200 or len(data) > 8192:
+            raise ValueError("无法取得任务许可")
+        return json.loads(data)
+    finally:
+        connection.close()
+
+
+class GameplayLease:
+    def __init__(self, token, task, owner, trust=None, request=request_permit):
+        self.token, self.task, self.owner = token, task, owner
+        self.trust = trust if trust is not None else json.loads(TRUST.read_bytes())
+        self.request = request
+        self.closed = threading.Event()
+        self.deadline = 0.
+
+    def refresh(self):
+        start = time.monotonic()
+        challenge = secrets.token_hex(16)
+        reply = self.request(self.token, self.task, challenge)
+        if "signature" not in reply:
+            raise ValueError("会员任务授权已失效，请重新登录")
+        grant = unpack_signed(reply, self.trust["permit"])
+        if (grant.get("product"), grant.get("nonce"), grant.get("task"), grant.get("session"), grant.get("keyId")) != (
+                "liaoban-permit-v2", challenge, self.task, hashlib.sha256(self.token.encode()).hexdigest(), self.trust["keyId"]):
+            raise ValueError("任务许可不匹配")
+        duration = grant.get("leaseMs")
+        if type(duration) is not int or not 0 < duration <= 8000 or start + duration / 1000 <= time.monotonic():
+            raise ValueError("任务许可已过期")
+        key = base64.b64decode(grant["contentKey"], validate=True)
+        if len(key) != 32:
+            raise ValueError("内容密钥无效")
+        self.deadline = start + duration / 1000
+        return key
+
+    def open(self, root):
+        activate(root, self.refresh(), self.trust)
+        threading.Thread(target=self._renew, daemon=True).start()
+        return self
+
+    def _renew(self):
+        while not self.closed.wait(2):
+            try:
+                if self.is_set():
+                    break
+                self.refresh()
+            except Exception:
+                break
+        self.closed.set()
+
+    def is_set(self):
+        return self.closed.is_set() or time.monotonic() >= self.deadline or self.owner.is_set()
+
+    def wait(self, seconds):
+        end = time.monotonic() + seconds
+        while not self.is_set():
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.closed.wait(min(0.05, remaining))
+        return True

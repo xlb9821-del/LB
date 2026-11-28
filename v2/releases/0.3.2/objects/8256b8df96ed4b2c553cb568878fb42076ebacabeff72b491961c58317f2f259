@@ -1,0 +1,161 @@
+"""ADB screenshots and read-only discovery of local MuMu instances."""
+
+import ipaddress
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+
+from .screenshots import Screenshot, ScreenshotError
+
+
+class AdbError(RuntimeError):
+    """A device or local installation could not complete the requested operation."""
+
+
+def _mumu_roots():
+    """Use registered installation directories and a few known installation layouts."""
+    if os.name == "nt":
+        import winreg
+
+        uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view) as parent:
+                        for index in range(winreg.QueryInfoKey(parent)[0]):
+                            try:
+                                key_name = winreg.EnumKey(parent, index)
+                                with winreg.OpenKey(parent, key_name) as key:
+                                    name = winreg.QueryValueEx(key, "DisplayName")[0]
+                                    if "mumu" in (str(name) + key_name).lower():
+                                        location = winreg.QueryValueEx(key, "InstallLocation")[0]
+                                        if location:
+                                            yield Path(os.path.expandvars(location.strip().strip('"')))
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "SystemDrive"):
+        base = os.environ.get(name)
+        if base:
+            root = Path(base + os.sep) if name == "SystemDrive" else Path(base)
+            yield root / "Netease" / "MuMuPlayer"
+            yield root / "MuMuPlayer"
+
+
+def find_adb(override: str | None = None) -> str:
+    """Resolve an explicit file, ADB_PATH, PATH, Android SDK or local MuMu."""
+    if override:
+        chosen = Path(os.path.expandvars(str(override).strip().strip('"'))).expanduser()
+        if chosen.is_file() and chosen.name.lower() in {"adb", "adb.exe"}:
+            return str(chosen.resolve())
+        raise AdbError("所选 ADB 路径无效，请选择模拟器或 Android SDK 的 adb.exe。")
+
+    candidates = [os.environ.get("ADB_PATH"), shutil.which("adb")]
+    sdk_paths = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")]
+    if os.environ.get("LOCALAPPDATA"):
+        sdk_paths.append(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk")
+    executable = "adb.exe" if os.name == "nt" else "adb"
+    candidates.extend(Path(root) / "platform-tools" / executable for root in sdk_paths if root)
+    for value in candidates:
+        if value:
+            path = Path(os.path.expandvars(str(value).strip().strip('"'))).expanduser()
+            if path.is_file() and path.name.lower() in {"adb", "adb.exe"}:
+                return str(path.resolve())
+
+    for root in _mumu_roots():
+        for relative in ("nx_main/adb.exe", "shell/adb.exe", "adb.exe"):
+            candidate = root / relative
+            if candidate.is_file():
+                return str(candidate.resolve())
+    raise AdbError("未找到 ADB，请选择模拟器或 Android SDK 的 adb.exe。")
+
+
+def _run(executable: str, *args: str, timeout: int = 12) -> bytes:
+    try:
+        result = subprocess.run(
+            [executable, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AdbError("设备命令超时，请检查模拟器状态。") from exc
+    except OSError as exc:
+        raise AdbError(f"无法启动设备工具，请检查所选程序路径。{exc}") from exc
+    if result.returncode:
+        diagnostic = (result.stderr or result.stdout)[:700].decode("utf-8", errors="replace").strip()
+        raise AdbError(f"设备命令失败（{result.returncode}）{diagnostic}")
+    return result.stdout
+
+
+def devices(adb: str) -> list[dict]:
+    rows = []
+    for line in _run(adb, "devices", "-l").decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("List of devices", "*")):
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        model = next((value[6:] for value in fields[2:] if value.startswith("model:")), "")
+        rows.append({"serial": fields[0], "state": fields[1], "model": model})
+    return rows
+
+
+def _valid_endpoint(value: str) -> bool:
+    match = re.fullmatch(r"(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9][a-zA-Z0-9_.-]*):([0-9]{1,5})", value)
+    if not match or not 1 <= int(match[2]) <= 65535:
+        return False
+    if match[1].startswith("["):
+        try:
+            ipaddress.IPv6Address(match[1][1:-1])
+        except ValueError:
+            return False
+    return True
+
+
+def connect(adb: str, address: str) -> str:
+    address = address.strip()
+    if not _valid_endpoint(address):
+        raise AdbError("请输入主机和端口，例如 127.0.0.1:16384。")
+    response = _run(adb, "connect", address).decode("utf-8", errors="replace").strip()
+    acknowledged = re.fullmatch(r"(?:already )?connected to (\S+)", response, re.IGNORECASE)
+    candidates = {address}
+    if acknowledged and _valid_endpoint(acknowledged[1]):
+        candidates.add(acknowledged[1])
+    for attempt in range(5):
+        for device in devices(adb):
+            if device["serial"] in candidates and device["state"] == "device":
+                return device["serial"]
+        if not acknowledged or attempt == 4:
+            break
+        time.sleep(0.2)
+    raise AdbError(f"设备尚未上线，请确认模拟器已启动并启用 ADB。{response[:350]}")
+
+
+def capture(adb: str, serial: str) -> bytes:
+    if not serial or serial.startswith("-") or not re.fullmatch(r"[!-~]+", serial):
+        raise AdbError("请选择一个有效的在线设备。")
+    data = _run(adb, "-s", serial, "exec-out", "screencap", "-p")
+    try:
+        return Screenshot.from_png(data).png
+    except ScreenshotError as exc:
+        raise AdbError(str(exc)) from exc
+
+
+def discover_mumu(adb: str) -> list[dict]:
+    """Return running endpoints in the format used by the original Tk device bar."""
+    from .emulators import discover_mumu_instances
+
+    return [
+        {"name": instance["name"], "address": instance["address"]}
+        for instance in discover_mumu_instances(adb)
+        if instance["status"] == "running"
+    ]

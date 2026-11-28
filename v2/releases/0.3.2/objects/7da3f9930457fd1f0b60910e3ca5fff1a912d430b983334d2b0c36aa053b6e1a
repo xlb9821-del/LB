@@ -1,0 +1,45 @@
+"""Return one 640 x 360 RGBA preview frame for each request on stdin."""
+
+import os
+import sys
+
+
+def main():
+    import ctypes
+    import json
+    from contextlib import ExitStack
+
+    import cv2
+    import numpy as np
+
+    from packages.lb_core.mumu_pixels import MuMuPixels
+
+    with ExitStack() as stack:
+        # The vendor DLL writes diagnostics to process stdout. Keep the frame pipe binary.
+        output = stack.enter_context(os.fdopen(os.dup(sys.stdout.fileno()), "wb"))
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        kernel = ctypes.windll.kernel32
+        kernel.GetStdHandle.restype = ctypes.c_void_p
+        kernel.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+        kernel.SetStdHandle(-11, kernel.GetStdHandle(-12))
+        source = json.loads(sys.stdin.buffer.readline())
+        pixels = stack.enter_context(MuMuPixels(source["mumu"], source["package"], source["display"]))
+        while sys.stdin.buffer.read(1) == b"F":
+            raw = pixels.grab()
+            width, height = pixels.size
+            bottom_up = np.ctypeslib.as_array(raw).reshape(height, width, 4)
+            small = cv2.resize(bottom_up, (640, 360), interpolation=cv2.INTER_LINEAR)
+            rgba = cv2.flip(small, 0)
+            rgba[:, :, 3] = 255
+            output.write(memoryview(rgba))
+            output.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, EOFError):
+        pass
+    except Exception as exc:
+        print(f"LB_PREVIEW_ERROR {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)

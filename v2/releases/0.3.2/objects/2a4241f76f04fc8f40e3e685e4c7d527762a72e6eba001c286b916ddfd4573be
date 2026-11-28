@@ -1,0 +1,342 @@
+"""Run one workbench test in an isolated MuMu SDK process, cancellable via stdin EOF."""
+
+import base64
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+
+from packages.lb_core.materials import valid_id
+
+from .data_paths import DATA
+
+
+def pause_path(job_id):
+    if not valid_id(job_id):
+        raise ValueError("任务编号无效")
+    return DATA / "liaoban" / "controls" / (job_id + ".pause")
+
+
+def spawn_worker(resident=False):
+    return subprocess.Popen(
+        [sys.executable, "-E", "-s", "-B", "-X", "utf8", "-u", "-m", "apps.workbench.operation_process",
+         *(["--ocr"] if resident else [])], cwd=Path(__file__).resolve().parents[2],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+class OperationJob:
+    def __init__(self, job_id, request, worker=None):
+        self.id = job_id
+        self.address = (request.get("device") or {}).get("address")
+        self.resident = worker is not None
+        self.stop_lock = threading.Lock()
+        self.stop_timer = None
+        self.stop_requested = False
+        self.pause_path = pause_path(job_id) if request.get("client") == "liaoban" else None
+        if self.pause_path:
+            self.pause_path.parent.mkdir(parents=True, exist_ok=True)
+            self.pause_path.unlink(missing_ok=True)
+        # Allow a gesture already delivered to Android to release before forcing exit.
+        config = request["config"]
+        duration = config.get("duration", [0, 1500])
+        maximum_hold = duration[1] if isinstance(duration, (list, tuple)) and len(duration) == 2 else 1500
+        self.stop_grace = 4 + (min(maximum_hold, 30000) / 1000 if
+                               config.get("mode") in ("click", "hold", "swipe") and type(maximum_hold) == int else 0)
+        self.state = {"status":"starting","samples":0,"executed":0,"condition":"连接原生截图"}
+        self.proc = worker if self.resident else spawn_worker()
+        try:
+            self.proc.stdin.write(json.dumps(request)+"\n")
+            self.proc.stdin.flush()
+        except BaseException:
+            self.proc.kill()
+            self.proc.wait()
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            raise
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        finished = False
+        try:
+            for line in self.proc.stdout:
+                update = json.loads(line)
+                self.state = {**self.state, **update}
+                if update.get("status") not in ("running","starting"):
+                    if self.resident:
+                        finished = True
+                        break
+                    self.stop()
+        except (ValueError,OSError) as exc:
+            self.state = dict(self.state,status="error",condition=str(exc))
+            self.proc.kill()
+        finally:
+            if not finished:
+                self.proc.stdout.close()
+                self.proc.wait()
+            with self.stop_lock:
+                if self.stop_timer:
+                    self.stop_timer.cancel()
+            if self.state["status"] in ("running","starting"):
+                if self.stop_requested:
+                    self.state = dict(self.state, status="stopped", condition="已停止")
+                else:
+                    self.state = dict(self.state, status="error", condition="原生操作进程意外结束")
+            if self.pause_path:
+                self.pause_path.unlink(missing_ok=True)
+
+    def set_pause(self, paused):
+        if not self.pause_path or type(paused) is not bool:
+            raise ValueError("暂停参数无效")
+        if paused:
+            self.pause_path.touch()
+        else:
+            self.pause_path.unlink(missing_ok=True)
+
+    def stop(self, *, wait=False):
+        with self.stop_lock:
+            active = self.state["status"] in ("running", "starting")
+            if self.resident and active and not self.stop_requested and self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write('{"stop":true}\n')
+                    self.proc.stdin.flush()
+                except OSError:
+                    pass
+            elif not self.resident and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+            if (active or not self.resident) and self.stop_timer is None and self.proc.poll() is None:
+                self.stop_requested = active
+                self.stop_timer = threading.Timer(self.stop_grace, self.proc.kill)
+                self.stop_timer.daemon = True
+                self.stop_timer.start()
+        if wait:
+            self.reader.join(self.stop_grace + 2)
+
+
+def _variants(ref):
+    from apps.workbench.library import WorkbenchLibrary
+    from apps.workbench.navigation import BUNDLE
+    from packages.lb_core.recognition import TemplateVariant
+
+    if not isinstance(ref,str) or not valid_id(ref[2:]):
+        raise ValueError("请选择有效的素材")
+    key = ref[2:]
+    if ref.startswith("f:"):
+        catalog = json.loads((BUNDLE/"materials.json").read_text(encoding="utf-8"))
+        item = next((m for m in catalog if m["id"]==key),None)
+        if item:
+            return [TemplateVariant(v["id"],item["name"],BUNDLE/"templates"/(v["id"]+".png"),v["roi"],v["threshold"])
+                    for v in item["variants"]]
+    elif ref.startswith("w:"):
+        library = WorkbenchLibrary(DATA / "workbench")
+        for source in library.list_materials():
+            for mark in source["marks"]:
+                if mark["kind"]=="template" and (mark.get("group_id") or mark["id"])==key:
+                    return library.recognition_templates(source["id"],mark["id"],mark.get("revision",0))[1]
+    raise ValueError("找不到所选模板或姿态组，请刷新素材")
+
+
+def resolve_operation_config(fields, library=None):
+    from packages.lb_core.operations import Operation
+
+    if fields.get("source") == "tap":
+        from .library import WorkbenchLibrary
+
+        ref = fields.get("tapRef")
+        if fields.get("mode") != "click" or not isinstance(ref, str) or not ref.startswith(("w:", "f:")):
+            raise ValueError("请选择随机点击使用的已标注盲点")
+        if library is None:
+            library = WorkbenchLibrary(DATA / "workbench")
+        if ref.startswith("f:"):
+            from .navigation import NavigationStore
+            region = next((row["rect"] for row in NavigationStore(library).regions if row["id"]==ref[2:]), None)
+            if region is None:
+                raise ValueError("找不到正式盲点，请重新选择")
+        else:
+            region = library.tap_region(ref[2:], fields.get("tapRevision"))
+        fields = dict(fields, source="region", region=region)
+    return Operation.parse(fields)
+
+
+def _run(request, emit, cancel):
+    if Path(__file__).resolve().parents[1].joinpath("liaoban/release-trust.json").is_file():
+        from apps.liaoban.gameplay_lease import GameplayLease
+        if request.get("client") != "liaoban" or request["config"].get("mode") not in ("chapter", "personal-realm", "regional-boss", "picture-scroll"):
+            raise ValueError("客户版仅支持已授权玩法")
+        lease = GameplayLease(request.pop("memberToken") or "", request["jobId"], cancel)
+        lease.open(request["contentRoot"])
+        try:
+            return _run_selected(request, emit, lease)
+        finally:
+            lease.closed.set()
+    if request.get("client") == "liaoban" and request.get("contentRoot"):
+        from apps.liaoban.content_runtime import select_snapshot
+        select_snapshot(request["contentRoot"])
+    return _run_selected(request, emit, cancel)
+
+
+def _run_selected(request, emit, cancel):
+    from packages.lb_core.device_lease import device_lease
+
+    if request["config"].get("mode") in ("navigation", "chapter", "picture-scroll", "regional-boss", "personal-realm", "team-preset", "battle", "click", "hold", "swipe"):
+        with device_lease(DATA / "device-locks", request["device"]["address"], request["binding"][2]):
+            return _execute(request, emit, cancel)
+    return _execute(request, emit, cancel)
+
+
+def _execute(request, emit, cancel):
+    import cv2
+    from packages.lb_core.mumu_pixels import MuMuPixels
+    from packages.lb_core.operations import GameDevice, run_operation
+    from packages.lb_core.recognition import PixelMatcher
+
+    if request["config"].get("mode") in ("navigation", "scene", "picture-scroll", "regional-boss", "personal-realm", "team-preset", "battle", "chapter"):
+        mode = request["config"]["mode"]
+        if mode in ("regional-boss", "picture-scroll") and request.get("contentRoot"):
+            from packages.lb_core.materials import read_game_file
+            try:
+                marker = "assets/flows/regional-boss.json" if mode == "regional-boss" else "packages/lb_core/picture_scroll.py"
+                read_game_file(Path(request["contentRoot"]) / marker)
+            except (FileNotFoundError, KeyError) as exc:
+                name = "地域鬼王" if mode == "regional-boss" else "绘卷"
+                raise ValueError(f"当前玩法版本尚未包含{name}，请更新玩法") from exc
+        from .library import WorkbenchLibrary
+        from .navigation_run import run_navigation
+        device, binding = request["device"], request["binding"]
+        client = "liaoban" if request.get("client") == "liaoban" else "workbench"
+        library = WorkbenchLibrary(DATA / client)
+        with MuMuPixels(device["mumu"], binding[0], binding[3]) as pixels:
+            source = GameDevice(pixels, request["adb"], device["address"], binding, request["size"])
+            run_navigation(request["config"], source, cancel, emit, library,
+                           release_version=request.get("releaseVersion"),
+                           include_preview=client != "liaoban" or request.get("preview") is True,
+                           previous_release=request.get("previousRelease"),
+                           pause_file=pause_path(request["jobId"]) if client == "liaoban" else None)
+        return
+    config = resolve_operation_config(request["config"])
+    device = request["device"]
+    binding = request["binding"]
+    matcher = PixelMatcher(_variants(request["config"].get("ref"))) if config.use_template else None
+    ocr_reader = None
+    saved = request.get("frameSource") == "saved"
+    if config.mode == "ocr":
+        from apps.workbench.library import WorkbenchLibrary
+        from packages.lb_core.ocr import OcrRule, engine, read_text
+
+        fields = request["config"]
+        ref = fields.get("ocrRef")
+        if not isinstance(ref, str) or not ref.startswith("w:"):
+            raise ValueError("请选择 OCR 文字区")
+        library = WorkbenchLibrary(DATA / "workbench")
+        mark = library.area_annotation(ref[2:], "ocr", fields.get("ocrRevision"))
+        rule = OcrRule.parse(fields)
+        emit({"status": "starting", "condition": "准备本地 OCR 引擎"})
+        reader = engine()
+        def ocr_reader(frame):
+            return read_text(frame, mark["rect_ratio"], mark.get("ocr_layout", "line"), rule, recognize=reader)
+        if saved:
+            import numpy as np
+            raw = np.fromfile(library.preview_path(mark["capture_id"]), dtype=np.uint8)
+            frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if frame is None or config.ocr_run != "once":
+                raise ValueError("来源截图不可用或读取模式无效")
+            class SavedFrame:
+                def read(self):
+                    return frame
+    last_update = 0.
+    def report(state, frame):
+        nonlocal last_update
+        now = time.perf_counter()
+        if state["status"]=="running" and now-last_update < .20 and state["condition"]!="已执行手势":
+            return
+        last_update = now
+        if request.get("cropPreview") and frame is not None and state.get("ocr"):
+            from packages.lb_core.materials import pixel_rect
+            rect = mark["rect_ratio"]
+            x,y,r,b = pixel_rect(rect, (frame.shape[1],frame.shape[0]))
+            crop = frame[y:b,x:r]
+            scale = min(1, 900/(r-x), 500/(b-y))
+            if scale < 1:
+                crop = cv2.resize(crop, (max(1,round((r-x)*scale)), max(1,round((b-y)*scale))), interpolation=cv2.INTER_AREA)
+            ok, jpeg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY,92])
+            if ok:
+                state["ocr"]["crop"] = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+                state["ocr"]["cropBounds"] = [x,y,r,b]
+        if request.get("preview") and frame is not None:
+            thumbnail = cv2.resize(frame,(640,360),interpolation=cv2.INTER_AREA)
+            ok, jpeg = cv2.imencode(".jpg",thumbnail,[cv2.IMWRITE_JPEG_QUALITY,72])
+            if ok:
+                state["image"] = "data:image/jpeg;base64,"+base64.b64encode(jpeg).decode("ascii")
+        emit(state)
+    try:
+        if saved:
+            run_operation(config, SavedFrame(), None, cancel, report, read_ocr=ocr_reader)
+            return
+        with MuMuPixels(device["mumu"],binding[0],binding[3]) as pixels:
+            source = GameDevice(pixels,request["adb"],device["address"],binding,request["size"])
+            run_operation(config,source,matcher,cancel,report,previous_release=request.get("previousRelease"),read_ocr=ocr_reader)
+    finally:
+        if matcher:
+            matcher.close()
+
+
+def main():
+    import ctypes
+    from msvcrt import get_osfhandle
+
+    # Vendor diagnostics can write through both the C runtime and Win32 stdout.
+    with os.fdopen(os.dup(sys.stdout.fileno()),"w",encoding="utf-8") as protocol:
+        os.dup2(sys.stderr.fileno(),sys.stdout.fileno())
+        kernel = ctypes.WinDLL("kernel32",use_last_error=True)
+        kernel.SetStdHandle.argtypes = [ctypes.c_ulong,ctypes.c_void_p]
+        kernel.SetStdHandle(-11,get_osfhandle(sys.stderr.fileno()))
+        def emit(state):
+            protocol.write(json.dumps(state,ensure_ascii=False)+"\n")
+            protocol.flush()
+        resident = "--ocr" in sys.argv
+        with os.fdopen(sys.stdin.fileno(), "rb", buffering=0, closefd=False) as commands:
+            stdin_handle = get_osfhandle(sys.stdin.fileno())
+            kernel.PeekNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+                                             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            class OwnerPipe:
+                def is_set(self):
+                    available = ctypes.c_ulong()
+                    connected = kernel.PeekNamedPipe(stdin_handle,None,0,None,ctypes.byref(available),None)
+                    return not connected or resident and available.value > 0
+
+                def wait(self, seconds):
+                    end = time.perf_counter()+seconds
+                    while not self.is_set():
+                        remaining = end-time.perf_counter()
+                        if remaining <= 0:
+                            return False
+                        time.sleep(min(.025, remaining))
+                    return True
+            for line in commands:
+                try:
+                    request = json.loads(line)
+                    if request.get("stop"):
+                        continue
+                    # The next request may use the warm engine as soon as the terminal
+                    # reply arrives, so release the current capture before sending it.
+                    final = None
+                    def report(state):
+                        nonlocal final
+                        if state["status"] in ("starting", "running"):
+                            emit(state)
+                        else:
+                            final = state
+                    _run(request, report, OwnerPipe())
+                    emit(final)
+                except Exception as exc:
+                    emit({"status":"error","condition":str(exc) or "操作测试失败"})
+                if not resident:
+                    break
+
+
+if __name__ == "__main__":
+    main()

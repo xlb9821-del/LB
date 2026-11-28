@@ -1,0 +1,76 @@
+"""A MuMu capture handle belonging to one instance and one game display."""
+
+import ctypes as ct
+
+from .adb import AdbError
+from .screenshots import require_landscape_16_9
+
+
+class MuMuPixels:
+    def __init__(self, mumu, package, expected_display=None):
+        self.mumu = mumu
+        self.package = package.encode("ascii")
+        self.expected_display = expected_display
+        self.handle = 0
+        self.size = None
+        self.buffer = None
+
+    def __enter__(self):
+        dll = self.dll = ct.CDLL(self.mumu["dll"])
+        integer = ct.c_int
+        dll.nemu_connect.argtypes = [ct.c_wchar_p, integer]
+        dll.nemu_disconnect.argtypes = [integer]
+        dll.nemu_get_display_id.argtypes = [integer, ct.c_char_p, integer]
+        dll.nemu_capture_display.argtypes = [integer, ct.c_uint, integer, ct.POINTER(integer),
+                                              ct.POINTER(integer), ct.POINTER(ct.c_ubyte)]
+        self.handle = dll.nemu_connect(self.mumu["root"], self.mumu["index"])
+        if self.handle <= 0:
+            raise AdbError("无法连接所选 MuMu 实例的截图组件。")
+        try:
+            self.display = dll.nemu_get_display_id(self.handle, self.package, 0)
+            if self.display < 0 or self.expected_display is not None and self.display != self.expected_display:
+                raise AdbError("MuMu 游戏画面已切换，请重新连接。")
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *_):
+        if self.handle > 0:
+            self.dll.nemu_disconnect(self.handle)
+            self.handle = 0
+
+    def grab(self):
+        if self.dll.nemu_get_display_id(self.handle, self.package, 0) != self.display:
+            raise AdbError("MuMu 游戏显示屏已切换，请重新连接。")
+        w, h = ct.c_int(), ct.c_int()
+        capture = self.dll.nemu_capture_display
+        if capture(self.handle, self.display, 0, ct.byref(w), ct.byref(h), None):
+            raise AdbError("无法读取游戏画面尺寸。")
+        size = w.value, h.value
+        if not all(0 < n <= 8192 for n in size):
+            raise AdbError("游戏画面尺寸无效。")
+        require_landscape_16_9(*size)
+        if self.size is None:
+            self.size = size
+            self.buffer = (ct.c_ubyte * (w.value * h.value * 4))()
+        if size != self.size:
+            raise AdbError("游戏分辨率已变化，请重新连接。")
+        if (capture(self.handle, self.display, len(self.buffer), ct.byref(w), ct.byref(h), self.buffer)
+                or (w.value, h.value) != size
+                or self.dll.nemu_get_display_id(self.handle, self.package, 0) != self.display):
+            raise AdbError("读取过程中游戏画面已变化，请重新连接。")
+        return self.buffer
+
+    def read(self):
+        import cv2
+        import numpy as np
+        from .materials import CANVAS_SIZE
+
+        raw = self.grab()
+        width, height = self.size
+        bottom_up = np.ctypeslib.as_array(raw).reshape(height, width, 4)
+        image = cv2.cvtColor(bottom_up[::-1], cv2.COLOR_RGBA2BGR)
+        if self.size != CANVAS_SIZE:
+            image = cv2.resize(image, CANVAS_SIZE, interpolation=cv2.INTER_LANCZOS4)
+        return image

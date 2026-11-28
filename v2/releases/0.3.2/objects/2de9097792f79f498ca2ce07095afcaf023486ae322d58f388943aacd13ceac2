@@ -1,0 +1,89 @@
+"""Image coordinates and material identity shared by the LB applications."""
+
+import math
+import re
+import secrets
+import string
+import sys
+
+
+CANVAS_SIZE = (1600, 900)
+_ID_ALPHABET = string.ascii_lowercase + string.digits
+_ID_PATTERN = re.compile(r"[a-z0-9]{24}")
+
+
+def new_material_id() -> str:
+    # A single alphabet case also makes IDs unambiguous on Windows filesystems.
+    while True:
+        code = "".join(secrets.choice(_ID_ALPHABET) for _ in range(24))
+        if not code.isalpha() and not code.isdigit():
+            return code
+
+
+def valid_id(value: object) -> bool:
+    return isinstance(value, str) and _ID_PATTERN.fullmatch(value) is not None
+
+
+def rect_xyxy(value, size=CANVAS_SIZE) -> tuple[int, int, int, int]:
+    """Validate half-open pixel bounds on an image."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError("选框需要左、上、右、下四个边界")
+    if any(type(number) is not int for number in value):
+        raise ValueError("选框边界必须使用整数像素")
+    left, top, right, bottom = value
+    width, height = size
+    if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        raise ValueError("选框需要位于画面内，宽度和高度至少为 1 像素")
+    return left, top, right, bottom
+
+
+def normalized_rect(value, size=CANVAS_SIZE) -> list[float]:
+    left, top, right, bottom = rect_xyxy(value, size)
+    width, height = size
+    return [left / width, top / height, right / width, bottom / height]
+
+
+def ratio_rect(value) -> list[float]:
+    """Validate left, top, right, bottom as fractions of the full game image."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError("选框需要左、上、右、下四个比例边界")
+    if any(type(v) not in (int, float) or not 0 <= v <= 1 for v in value):
+        raise ValueError("选框比例必须在 0 到 1 之间")
+    left, top, right, bottom = value
+    if left >= right or top >= bottom:
+        raise ValueError("选框的宽度和高度必须大于零")
+    return list(value)
+
+
+def pixel_rect(value, size) -> tuple[int, int, int, int]:
+    """Resolve a proportional box to covering pixels on this particular image."""
+    left, top, right, bottom = ratio_rect(value)
+    width, height = size
+    if any(type(n) is not int or n <= 0 for n in size):
+        raise ValueError("图像尺寸必须为正整数")
+
+    def edge(fraction, length):
+        scaled = fraction * length
+        nearest = round(scaled)
+        # Preserve exact pixel edges when round-tripping a legacy integer box.
+        return nearest if abs(scaled - nearest) <= math.ulp(scaled) else scaled
+
+    x = min(width - 1, math.floor(edge(left, width)))
+    y = min(height - 1, math.floor(edge(top, height)))
+    return (x, y, max(x + 1, math.ceil(edge(right, width))),
+            max(y + 1, math.ceil(edge(bottom, height))))
+
+
+def default_search_rect(value) -> tuple[int, int, int, int]:
+    """Include a half-template margin on each side, clipped to the canvas."""
+    left, top, right, bottom = rect_xyxy(value)
+    width, height = CANVAS_SIZE
+    margin_x = max(1, (right - left) // 2)
+    margin_y = max(1, (bottom - top) // 2)
+    return (max(0, left - margin_x), max(0, top - margin_y),
+            min(width, right + margin_x), min(height, bottom + margin_y))
+def read_game_file(path):
+    """Use the signed content reader when a customer task has opened its revision."""
+    protected = sys.modules.get("apps.liaoban.protected_content")
+    return protected.read_game_file(path) if protected else path.read_bytes()
+

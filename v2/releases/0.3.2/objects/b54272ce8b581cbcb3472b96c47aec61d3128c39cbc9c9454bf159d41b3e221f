@@ -1,0 +1,188 @@
+"""Editable navigation records with bundled courtyard footage as the starting point."""
+
+import hashlib
+import json
+import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from .library import _edit_lock
+from packages.lb_core.materials import read_game_file, valid_id
+from packages.lb_core.navigation_catalog import BUNDLE
+
+
+def read(path):
+    return json.loads(read_game_file(path))
+
+
+def _id(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", value) is not None
+
+
+def _text(value, limit, required=False):
+    return isinstance(value, str) and len(value) <= limit and (not required or bool(value.strip()))
+
+
+def tap_regions(rules):
+    regions = {}
+    for rule in rules.values():
+        if "region" in rule:
+            x, y, w, h = rule["region"]
+            regions[rule["id"]] = dict(id=rule["id"], name=rule["name"], scene=rule["scene"],
+                rect=[x/1600, y/900, (x+w)/1600, (y+h)/900], capture=rule.get("source"))
+    return list(regions.values())
+
+
+def merge_defaults(old, edited, shipped):
+    """Keep local field edits and deletions while adopting changes to shipped pages and buttons."""
+    previous = {r["id"]: r for r in old}
+    latest = {r["id"]: r for r in shipped}
+    rows = []
+    for local in edited:
+        key = local["id"]
+        before, after = previous.get(key), latest.get(key)
+        if before is None or after is None:
+            if before != local:
+                rows.append(local)
+            continue
+        row = dict(after)
+        for field, value in local.items():
+            if field == "actions":
+                row[field] = merge_defaults(before.get(field, []), value, after.get(field, []))
+            elif value != before.get(field):
+                row[field] = value
+        rows.append(row)
+    occupied = set(previous) | {r["id"] for r in edited}
+    rows.extend(row for row in shipped if row["id"] not in occupied)
+    return rows
+
+
+class NavigationStore:
+    def __init__(self, library):
+        self.library = library
+        self.folder = library.root / "navigation"
+        self.folder.mkdir(exist_ok=True)
+        self.path = self.folder / "network.json"
+
+    @property
+    def regions(self):
+        return tap_regions({**read(BUNDLE / "routes.json")["rules"], **read(BUNDLE / "daily.json")["rules"]})
+
+    def network(self, defaults=None):
+        if defaults is None:
+            defaults = read(BUNDLE / "pages.json")
+        version = hashlib.sha256(json.dumps(defaults, sort_keys=True).encode()).hexdigest()
+        if not self.path.exists():
+            return {"revision": 0, "defaultsVersion": version, "pages": defaults}
+        network = read(self.path)
+        previous = network.get("basePages")
+        if previous is None:
+            previous = read(BUNDLE / "legacy/pages-v3.json")
+        base = {p["id"]: p for p in previous}
+        local = {p["id"]: p for p in network["pages"]}
+        if network.get("bundleVersion", 1) < 2:
+            # v1 stored whole edited pages. Only fill the two newly researched controls.
+            login = local.get("account-login")
+            if login is None:
+                network["pages"].append(base["account-login"])
+            elif not login["actions"] and login["frame"] == "capture:3g11moil2edqr0zu8joyequs":
+                login["actions"] = base["account-login"]["actions"]
+            day = next(a for a in base["courtyard"]["actions"] if a["to"] == "daily")
+            for action in local.get("courtyard", {}).get("actions", []):
+                if (action["id"] == day["id"] and action["to"] == "daily" and not action["ref"]
+                        and action["status"] == "点击位置待核对"):
+                    action.update(ref=day["ref"], status=day["status"])
+        if network.get("bundleVersion", 1) < 3:
+            scroll = next(a for a in base["courtyard"]["actions"] if a["id"] == "wph6xxvlsyvjvqvk9szqmxq9")
+            for action in local.get("courtyard", {}).get("actions", []):
+                if (action["id"] == scroll["id"] and not action["ref"] and action["status"] == "待补录"
+                        and action["note"] == "展开或收起底部菜单，操作待补录。"):
+                    action.update(ref=scroll["ref"], status=scroll["status"], note=scroll["note"])
+        if network.get("bundleVersion", 1) < 4:
+            day = next(a for a in base["courtyard"]["actions"] if a["to"] == "daily")
+            for a in local.get("courtyard", {}).get("actions", []):
+                if a["id"] == day["id"] and a["to"] == "daily" and a["note"] == "已看见目标界面，具体点击位置待核对。":
+                    a["note"] = day["note"]
+        return {"revision": network["revision"], "defaultsVersion": version,
+                "pages": merge_defaults(previous, network["pages"], defaults)}
+
+    def load(self):
+        from packages.lb_core.navigation_catalog import NavigationCatalog
+        from .navigation_directory import directory_view
+        network = self.network()
+        catalog = NavigationCatalog(network["pages"])
+        neighbors = {k:list(dict.fromkeys(dest for dest, _ in edges)) for k,edges in catalog.graph.items()}
+        materials = read(BUNDLE / "materials.json")
+        return dict(network, frames=read(BUNDLE / "frames.json"), formal=materials, regions=tap_regions(catalog.data["rules"]),
+                    targets=catalog.paths, neighbors=neighbors, labels=catalog.labels, **directory_view(catalog, materials))
+
+    def update(self, request):
+        with _edit_lock(self.folder):
+            defaults = read(BUNDLE / "pages.json")
+            network = self.network(defaults)
+            if (request.get("revision") != network["revision"]
+                    or request.get("defaultsVersion", network["defaultsVersion"]) != network["defaultsVersion"]):
+                raise ValueError("导航资料已由其他窗口更新，请刷新后重试。")
+            pages = {p["id"]: p for p in network["pages"]}
+            if request.get("delete"):
+                page_id = request["delete"]
+                if page_id not in pages:
+                    raise ValueError("找不到这个界面。")
+                if any(a["to"] == page_id for p in pages.values() if p["id"] != page_id for a in p["actions"]):
+                    raise ValueError("其他界面的按钮仍指向这里，请先修改这些去向。")
+                del pages[page_id]
+            else:
+                page = request["page"]
+                if not _id(page.get("id")) or not _text(page.get("name"), 80, True) or not _text(page.get("section"), 80, True):
+                    raise ValueError("请填写界面名称和模块。")
+                if page.get("kind") not in ("整页", "弹窗", "侧栏") or page.get("mode") not in ("any", "all"):
+                    raise ValueError("无效的界面类型或识别条件。")
+                old = pages.get(page["id"], {})
+                self._validate_page(page, old, set(pages) | {page["id"]})
+                pages[page["id"]] = page
+            updated = {"revision": network["revision"] + 1, "defaultsVersion": network["defaultsVersion"], "pages": list(pages.values())}
+            stored = dict(updated, bundleVersion=4, basePages=defaults)
+            with TemporaryDirectory(dir=self.folder) as tmp:
+                stage = Path(tmp) / "network.json"
+                stage.write_text(json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8")
+                stage.replace(self.path)
+            return updated
+
+    def _validate_page(self, page, old, ids):
+        sources = self.library.list_materials()
+        refs = {"f:" + item["id"]: "template" for item in read(BUNDLE / "materials.json")}
+        refs.update({"f:" + region["id"]: "tap" for region in self.regions})
+        for source in sources:
+            for mark in source["marks"]:
+                refs["w:" + (mark.get("group_id") or mark["id"])] = mark["kind"]
+        frames = {"video:" + f["id"] for f in read(BUNDLE / "frames.json")} | {"capture:" + c["id"] for c in sources}
+        frame = page.get("frame")
+        if frame and frame != old.get("frame") and frame not in frames:
+            raise ValueError("参考画面已失效，请重新选择。")
+        def allowed(ref, previous, recognition=False):
+            return (isinstance(ref, str) and ref[:2] in ("w:", "f:") and valid_id(ref[2:])
+                    and ((ref in refs and (not recognition or refs[ref] == "template")) or ref in previous))
+        for field in ("include", "exclude"):
+            values = page.get(field)
+            if not isinstance(values, list) or not all(allowed(r, old.get(field, []), True) for r in values) or len(set(values)) != len(values):
+                raise ValueError("识别条件需要选择有效的模板或姿态组。")
+        if set(page["include"]) & set(page["exclude"]):
+            raise ValueError("同一素材不能同时作为识别条件和排除条件。")
+        previous = {a["id"]: a["ref"] for a in old.get("actions", [])}
+        seen = set()
+        for a in page["actions"]:
+            if not _id(a["id"]) or a["id"] in seen or not _text(a["name"], 80, True):
+                raise ValueError("按钮名称或编号无效。")
+            seen.add(a["id"])
+            if a["kind"] not in ("入口", "返回", "功能") or a["op"] not in ("点击", "长按", "滑动"):
+                raise ValueError("无效的操作。")
+            if a["to"] and (a["to"] not in ids or a["kind"] == "功能"):
+                raise ValueError("请选择有效的目标界面。")
+            if a["kind"] != "功能" and not a["to"] and a["status"] != "待补录":
+                raise ValueError("请选择目标界面，或将这项标为待补录。")
+            if not _text(a["note"], 500, a["kind"] == "功能") or not _text(a["stamp"], 100):
+                raise ValueError("请核对功能说明和录像位置。")
+            if a["status"] not in ("录像可见", "点击位置待核对", "待补录", "实机已验证") or type(a["loading"]) is not bool:
+                raise ValueError("无效的记录状态。")
+            if a["ref"] and not allowed(a["ref"], [previous.get(a["id"])]):
+                raise ValueError("关联的按钮素材已失效，请重新选择。")

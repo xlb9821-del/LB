@@ -1,0 +1,119 @@
+"""Read horizontal text in a proportional area of a BGR frame, entirely offline."""
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+import math
+import operator
+import os
+from pathlib import Path
+import re
+from time import perf_counter
+import unicodedata
+
+import numpy as np
+
+from .materials import pixel_rect, ratio_rect
+
+_MODELS = {"Det": "PP-OCRv6_det_tiny.onnx", "Rec": "PP-OCRv6_rec_tiny.onnx",
+           "Cls": "ch_ppocr_mobile_v2.0_cls_mobile.onnx"}
+_COMPARISONS = {"eq": operator.eq, "gt": operator.gt, "ge": operator.ge,
+                "lt": operator.lt, "le": operator.le}
+
+
+@lru_cache(maxsize=1)
+def engine():
+    directory = Path(os.environ.get("LIAOBAN_INSTALL_ROOT") or Path(__file__).resolve().parents[2]) / "assets/ocr"
+    paths = {f"{key}.model_path": str(directory / name) for key, name in _MODELS.items()}
+    if not all(Path(path).is_file() for path in paths.values()):
+        raise ValueError("OCR 模型缺失，请检查 assets/ocr")
+    from rapidocr import RapidOCR, ModelType, OCRVersion
+    return RapidOCR(params={**paths, "Det.model_type": ModelType.TINY, "Rec.model_type": ModelType.TINY,
+                            "Det.ocr_version": OCRVersion.PPOCRV6, "Rec.ocr_version": OCRVersion.PPOCRV6,
+                            "Global.use_cls": False, "Global.log_level": "warning", "Global.text_score": 0.0,
+                            "Det.limit_type": "max", "Det.limit_side_len": 736,
+                            "EngineConfig.onnxruntime.intra_op_num_threads": 2,
+                            "EngineConfig.onnxruntime.inter_op_num_threads": 1})
+
+
+def number(text):
+    value = unicodedata.normalize("NFKC", text).strip()
+    unit = value[-1:]
+    multiplier = {"万": 10000, "亿": 100000000}.get(unit)
+    if multiplier:
+        value = value[:-1].rstrip()
+    if not re.fullmatch(r"[+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?", value):
+        return None
+    try:
+        numeric = Decimal(value.replace(",", ""))
+        return numeric * multiplier if multiplier else numeric
+    except InvalidOperation:
+        return None
+
+
+@dataclass(frozen=True)
+class OcrRule:
+    condition: str
+    target: str
+    confidence: float
+
+    @classmethod
+    def parse(cls, fields):
+        condition = fields.get("ocrCondition", "read")
+        target = fields.get("ocrTarget", "")
+        threshold = fields.get("ocrConfidence", .8)
+        if condition not in ("read", "equals", "contains", *_COMPARISONS):
+            raise ValueError("OCR 判断条件无效")
+        if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+            raise ValueError("OCR 最低置信度应在 0 至 1 之间")
+        if not isinstance(target, str) or len(target) > 256 or condition != "read" and not target.strip():
+            raise ValueError("请填写有效的 OCR 判断值")
+        if condition in _COMPARISONS and number(target) is None:
+            raise ValueError("OCR 数值比较需要有效的数字")
+        return cls(condition, target.strip(), threshold)
+
+    def matches(self, text):
+        def normalize(value):
+            return unicodedata.normalize("NFKC", value).strip().casefold()
+        if self.condition == "read":
+            return True
+        if self.condition == "equals":
+            return normalize(text) == normalize(self.target)
+        if self.condition == "contains":
+            return normalize(self.target) in normalize(text)
+        actual = number(text)
+        return actual is not None and _COMPARISONS[self.condition](actual, number(self.target))
+
+
+def read_text(frame, region, layout, rule, *, recognize=None):
+    if layout not in ("line", "block"):
+        raise ValueError("OCR 读取方式无效")
+    height, width = frame.shape[:2]
+    x, y, right, bottom = pixel_rect(ratio_rect(region), (width, height))
+    reader = recognize if recognize is not None else engine()
+    started = perf_counter()
+    crop = np.ascontiguousarray(frame[y:bottom, x:right])
+    if np.all(crop == crop[0, 0]):
+        return {"lines": [], "matched": False, "readable": False, "condition": "未读到",
+                "ocrMs": round((perf_counter()-started)*1000, 1)}
+    result = reader(crop, use_det=layout == "block", use_cls=False, use_rec=True)
+    lines = []
+    for i, (text, score) in enumerate(zip(result.txts or (), result.scores or ())):
+        if not text.strip() or not math.isfinite(score):
+            continue
+        rect = [x, y, right, bottom]
+        if layout == "block":
+            points = np.asarray(result.boxes[i])
+            left, top = np.maximum(0, np.floor(points.min(axis=0))).astype(int)
+            r, b = np.minimum((right-x, bottom-y), np.ceil(points.max(axis=0))).astype(int)
+            if r <= left or b <= top:
+                continue
+            rect = [x+left, y+top, x+r, y+b]
+        accepted = score >= rule.confidence
+        lines.append({"text": text, "confidence": float(score), "accepted": bool(accepted),
+                      "matches": bool(accepted and rule.matches(text)),
+                      "rect": [float(v/d) for v,d in zip(rect, (width,height,width,height))]})
+    readable = any(line["accepted"] for line in lines)
+    matched = any(line["matches"] for line in lines)
+    status = "未读到" if not readable else "已读到" if rule.condition == "read" else "条件满足" if matched else "条件未满足"
+    return {"lines": lines, "matched": matched, "readable": readable, "condition": status,
+            "ocrMs": round((perf_counter()-started)*1000, 1)}

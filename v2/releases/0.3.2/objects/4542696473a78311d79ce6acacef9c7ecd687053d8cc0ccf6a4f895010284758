@@ -1,0 +1,245 @@
+"""Discover selectable MuMu instances and existing ADB transports."""
+
+import ipaddress
+import json
+from pathlib import Path
+import re
+import time
+
+from . import adb
+from .displays import ONMYOJI_PACKAGE
+
+
+def _endpoint(info: dict) -> str | None:
+    try:
+        host = ipaddress.ip_address(info.get("adb_host_ip", ""))
+    except ValueError:
+        return None
+    port = info.get("adb_port")
+    if isinstance(port, str) and re.fullmatch(r"[0-9]{1,5}", port):
+        port = int(port)
+    if type(port) is not int or not 1 <= port <= 65535:
+        return None
+    if host.is_unspecified:
+        host = ipaddress.ip_address("::1" if host.version == 6 else "127.0.0.1")
+    return f"[{host}]:{port}" if host.version == 6 else f"{host}:{port}"
+
+
+def _instance(root: Path, key: str, info: dict) -> dict | None:
+    if not re.fullmatch(r"[0-9]+", key) or str(info.get("index", key)) != key:
+        return None
+    index = int(key)
+    address = _endpoint(info)
+    if info.get("error_code", 0) != 0:
+        status = "unavailable"
+    elif info.get("is_android_started") is True:
+        status = "running" if address else "unavailable"
+    else:
+        status = "starting" if info.get("is_process_started") is True else "stopped"
+
+    # A MuMu 15 SDK belongs to a specific Android runtime. A different
+    # installed version's DLL cannot reliably target this instance's display.
+    sdk = Path("shell/sdk/external_renderer_ipc.dll")
+    version = info.get("android_version")
+    dll = root / sdk
+    if isinstance(version, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        version_dll = root / "nx_device" / version / sdk
+        if version_dll.is_file():
+            dll = version_dll
+
+    name = info.get("name")
+    return {
+        "id": f"mumu:{root.as_posix().casefold()}:{index}",
+        "name": name.strip() if isinstance(name, str) and name.strip() else f"MuMu 实例 {index}",
+        "address": address if status == "running" else None,
+        "status": status,
+        "mumu": {"root": str(root), "index": index, "dll": str(dll) if dll.is_file() else None},
+    }
+
+
+def _mumu_managers(adb_path: str):
+    adb_dir = Path(adb_path).parent
+    managers = [adb_dir / "MuMuManager.exe"]
+    for root in (adb_dir.parent, *adb._mumu_roots()):
+        managers.extend(root / folder / "MuMuManager.exe" for folder in ("nx_main", "shell"))
+
+    return [path for path in dict.fromkeys(managers) if path.is_file()]
+
+
+def _manager_root(manager: Path) -> Path:
+    root = manager.resolve().parent
+    return root.parent if root.name.lower() in ("nx_main", "shell") else root
+
+
+def discover_mumu_instances(adb_path: str) -> list[dict]:
+    """Use each installation's reported instance index and current address."""
+    results = {}
+    for manager in _mumu_managers(adb_path):
+        try:
+            raw = adb._run(str(manager), "info", "-v", "all", timeout=5)
+            info = json.loads(raw.decode("utf-8-sig"))
+        except (adb.AdbError, UnicodeError, ValueError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        root = _manager_root(manager)
+        entries = {str(info["index"]): info} if "index" in info else info
+        for key, record in entries.items():
+            if isinstance(record, dict):
+                item = _instance(root, key, record)
+                if item:
+                    results.setdefault(item["id"], item)
+    return sorted(results.values(), key=lambda item: (item["mumu"]["root"], item["mumu"]["index"]))
+
+
+def _instance_manager(adb_path: str, instance: dict) -> str:
+    for manager in _mumu_managers(adb_path):
+        if _manager_root(manager) == Path(instance["root"]):
+            return str(manager)
+    raise adb.AdbError("找不到对应的 MuMu 管理程序")
+
+
+def ensure_onmyoji_running(adb_path: str, device: dict) -> bool:
+    """Start the installed game once, only on the instance selected by discovery."""
+    instance = device["mumu"]
+    manager = _instance_manager(adb_path, instance)
+    app = ("control", "-v", str(instance["index"]), "app")
+
+    def info(*args):
+        raw = adb._run(manager, *app, "info", *args, timeout=8)
+        try:
+            result = json.loads(raw.decode("utf-8-sig"))
+        except (ValueError, UnicodeError) as exc:
+            raise adb.AdbError("MuMu 未返回有效的应用状态，请稍后重新连接。") from exc
+        if not isinstance(result, dict) or result.get("error_code", 0):
+            raise adb.AdbError("无法读取此模拟器的应用状态，请稍后重新连接。")
+        return result
+
+    installed = info("-i")
+    packages = [name for name in installed if ONMYOJI_PACKAGE.fullmatch(name)]
+    if not packages:
+        raise adb.AdbError(f"在「{device['name']}」中未找到阴阳师，请先安装游戏。")
+    for package in packages:
+        state = info("-pkg", package).get("state")
+        if state in ("running", "starting"):
+            return False
+        if state != "stopped":
+            raise adb.AdbError("未能确认阴阳师是否已启动，请稍后重新连接。")
+    if len(packages) > 1:
+        raise adb.AdbError("此模拟器安装了多个阴阳师版本，请先打开要使用的版本，再连接。")
+    package = packages[0]
+    adb._run(manager, *app, "launch", "-pkg", package, timeout=15)
+    deadline = time.monotonic() + 10
+    while info("-pkg", package).get("state") not in ("running", "starting"):
+        if time.monotonic() >= deadline:
+            raise adb.AdbError("已发送启动请求，但 MuMu 尚未确认游戏启动，请查看模拟器后重试。")
+        time.sleep(0.5)
+    return True
+
+
+def control_mumu(adb_path: str, instance_id: str, action: str):
+    if action not in ("launch", "shutdown"):
+        raise adb.AdbError("不支持的模拟器操作")
+    selected = next((item for item in discover_mumu_instances(adb_path) if item["id"] == instance_id), None)
+    if selected is None:
+        raise adb.AdbError("找不到所选 MuMu 实例，请刷新列表")
+    if selected["status"] != ("stopped" if action == "launch" else "running"):
+        raise adb.AdbError("模拟器状态已变化，请刷新后重试")
+    instance = selected["mumu"]
+    manager = _instance_manager(adb_path, instance)
+    adb._run(manager, "control", "-v", str(instance["index"]), action, timeout=30)
+
+
+def _address_key(address: str) -> str:
+    host, separator, port = address.rpartition(":")
+    if separator and host.lower() == "localhost":
+        return f"127.0.0.1:{port}"
+    return address
+
+
+def _boot_id(adb_path: str, serial: str) -> bytes | None:
+    try:
+        value = adb._run(adb_path, "-s", serial, "shell", "cat",
+                         "/proc/sys/kernel/random/boot_id", timeout=2).strip().lower()
+    except adb.AdbError:
+        return None
+    if re.fullmatch(rb"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+        return value
+    return None
+
+
+def _mumu_adb_aliases(adb_path: str, addresses: set[str], transports: list[dict]) -> set[str]:
+    if not addresses:
+        return set()
+    aliases = {}
+    by_address = {_address_key(row["serial"]): row for row in transports}
+    for row in transports:
+        serial = row["serial"]
+        if row["state"] == "device" and re.fullmatch(r"emulator-[0-9]+", serial):
+            identity = _boot_id(adb_path, serial)
+            if identity:
+                aliases[serial] = identity
+    if not aliases:
+        return set()
+
+    managed_boots = set()
+    for address in addresses:
+        row = by_address.get(address)
+        if row is None:
+            # On a fresh ADB server only the emulator-NNNN transport may exist.
+            host = address.rsplit(":", 1)[0].strip("[]")
+            if not ipaddress.ip_address(host).is_loopback:
+                continue
+            try:
+                adb._run(adb_path, "connect", address, timeout=2)
+            except adb.AdbError:
+                continue
+        elif row["state"] != "device":
+            continue
+        identity = _boot_id(adb_path, row["serial"] if row else address)
+        if identity:
+            managed_boots.add(identity)
+    return {serial for serial, identity in aliases.items() if identity in managed_boots}
+
+
+def discover_emulators(adb_path: str) -> list[dict]:
+    """List MuMu first, then other transports already visible to ADB."""
+    items = discover_mumu_instances(adb_path)
+    addresses = {_address_key(row["address"]) for row in items if row["address"]}
+    try:
+        transports = adb.devices(adb_path)
+    except adb.AdbError:
+        if items:
+            return items
+        raise
+    addresses.update(_mumu_adb_aliases(adb_path, addresses, transports))
+    statuses = {"device": "running", "offline": "offline", "unauthorized": "unauthorized"}
+    for transport in transports:
+        serial = transport["serial"]
+        key = _address_key(serial)
+        if key in addresses:
+            continue
+        addresses.add(key)
+        items.append({
+            "id": f"adb:{serial}",
+            "name": transport["model"] or serial,
+            "address": serial,
+            "status": statuses.get(transport["state"], "unavailable"),
+            "mumu": None,
+        })
+    return items
+
+
+def connect_emulator(adb_path: str, instance_id: str) -> dict:
+    """Re-read the selected instance's address so a restart can change its port."""
+    discover = discover_mumu_instances if isinstance(instance_id, str) and instance_id.startswith("mumu:") else discover_emulators
+    selected = next((item for item in discover(adb_path) if item["id"] == instance_id), None)
+    if selected is None:
+        raise adb.AdbError("所选模拟器已从列表中移除，请刷新后重新选择。")
+    if selected["status"] != "running":
+        if selected["status"] == "unauthorized":
+            raise adb.AdbError("所选设备尚未授权 ADB，请在设备上确认后重试。")
+        raise adb.AdbError("所选模拟器尚未就绪，请确认启动状态后刷新。")
+    if selected["mumu"]:
+        selected["address"] = adb.connect(adb_path, selected["address"])
+    return selected
